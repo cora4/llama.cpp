@@ -54,5 +54,13 @@ jobs:
         -S ${{ github.workspace }}
 
     - name: Build
+      id: gcc_build
       # Build your program with the given configuration. Note that --config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -t llama-server -j$(nproc)
+
+     - name: Upload Android Build Artifact
+      if: ${{ always() && steps.gcc_build.outcome == 'success' }}
+       uses: actions/upload-artifact@v6
+       with:
+         name: llama-cpp-bin-ubuntu-x86
+         path: pkg-adb/llama.cpp
