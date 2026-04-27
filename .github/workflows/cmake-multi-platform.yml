@@ -74,7 +74,7 @@ jobs:
           time cmake --build build --config Release -j $(nproc)
           
       - name: Upload Build Artifact
-        if: ${{ always() && steps.ubuntu-cpu.outcome == 'success' }}
+        if: ${{ always() && steps.cmake_build.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: llama-cpp-bin-ubuntu
