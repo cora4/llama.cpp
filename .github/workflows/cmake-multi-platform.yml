@@ -1,3 +1,4 @@
+
 # This starter workflow is for a CMake project running on multiple platforms. There is a different starter workflow if you just want a single platform.
 # See: https://github.com/actions/starter-workflows/blob/main/ci/cmake-single-platform.yml
 name: CMake on multiple platforms
@@ -36,7 +37,28 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set reusable strings
+    - name: Cache
+    uses: actions/cache@v5.0.5
+    with:
+      # A list of files, directories, and wildcard patterns to cache and restore
+      path: 
+      # An explicit key for restoring and saving the cache
+      key: 
+      # An ordered multiline string listing the prefix-matched keys, that are used for restoring stale cache if no cache hit occurred for key. Note `cache-hit` returns false in this case.
+      restore-keys: # optional
+      # The chunk size used to split up large files during upload, in bytes
+      upload-chunk-size: # optional
+      # An optional boolean when enabled, allows windows runners to save or restore caches that can be restored or saved respectively on other platforms
+      enableCrossOsArchive: # optional, default is false
+      # Fail the workflow if cache entry is not found
+      fail-on-cache-miss: # optional, default is false
+      # Check if a cache entry exists for the given input(s) (key, restore-keys) without downloading the cache
+      lookup-only: # optional, default is false
+      # Run the post step to save the cache even if another step before fails
+      save-always: # optional, default is false
+          
+
+   - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
       id: strings
       shell: bash
@@ -58,9 +80,9 @@ jobs:
       # Build your program with the given configuration. Note that --config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -t llama-server -j$(nproc)
 
-     - name: Upload Android Build Artifact
-      if: ${{ always() && steps.gcc_build.outcome == 'success' }}
+     - name: Upload Build Artifact
+       if: ${{ always() && steps.gcc_build.outcome == 'success' }}
        uses: actions/upload-artifact@v6
        with:
-         name: llama-cpp-bin-ubuntu-x86
+         name: llama-cpp-bin-ubuntu-x64
          path: pkg-adb/llama.cpp
