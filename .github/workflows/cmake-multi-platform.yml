@@ -17,11 +17,7 @@ jobs:
           - build: 'x64'
             os: ubuntu-22.04
           - build: 'arm64'
-            os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
-          - build: 'ppc64le'
-            os: ubuntu-24.04-ppc64le
+            os: ubuntu-22.04-arm
 
     runs-on: ${{ matrix.os }}
 
@@ -81,5 +77,5 @@ jobs:
         if: ${{ always() && steps.ubuntu-cpu.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
-          name: llama-cpp-bin-ubuntu-x64
+          name: llama-cpp-bin-ubuntu
           path: pkg-adb/llama.cpp
