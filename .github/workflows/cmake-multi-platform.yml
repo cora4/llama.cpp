@@ -72,7 +72,7 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             -DGGML_RPC=ON
           time cmake --build build --config Release -j $(nproc)
-          
+
       - name: Upload Build Artifact
         if: ${{ always() && steps.cmake_build.outcome == 'success' }}
         uses: actions/upload-artifact@v6
