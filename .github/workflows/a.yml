@@ -1,0 +1,36 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - build
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact with wget
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          # echo "hello world" > dist/output.txt
+          cd dist
+          test "$URL"
+          wget -q -O llama-b9103-bin-android-arm64.zip "$URL"
+      - name: Create Release
+        run: |
+          TAG=b9103-patched
+          # git tag $TAG
+          # git push origin $TAG
+          gh release upload $TAG $(ls dist/*)
+          # --title "Release $TAG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
