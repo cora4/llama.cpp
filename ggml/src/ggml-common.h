@@ -449,6 +449,17 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// 3.44 bpw (110 bytes / 256 values * 8 = 3.4375)
+typedef struct {
+    ggml_half d;               //  2 bytes - per-block scale
+    uint16_t extra;            //  2 bytes - extra info
+    uint16_t scales_h;         //  2 bytes - high bits of scales
+    uint8_t scales_l[QK_K/32]; //  8 bytes - low bits of scales
+    uint8_t qs[QK_K/4];        // 64 bytes - low 2 bits
+    uint8_t qh[QK_K/8];        // 32 bytes - high 1 bit
+} block_iq3_k;
+static_assert(sizeof(block_iq3_k) == sizeof(ggml_half) + 2*sizeof(uint16_t) + QK_K/32 + QK_K/4 + QK_K/8, "wrong iq3_k block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1115,6 +1126,12 @@ GGML_TABLE_END()
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+GGML_TABLE_END()
+
+// IQ3_K lookup table
+GGML_TABLE_BEGIN(int8_t, iq3nl_values, 16)
+    -63, -40, -23, -10, 1, 13, 28,  47,
+    -59, -36, -19,  -6, 5, 17, 32,  51,
 GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048
