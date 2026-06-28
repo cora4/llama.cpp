@@ -57,7 +57,7 @@ jobs:
             -DGGML_BACKEND_DL=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_CPU_ALL_VARIANTS=ON \
-            -DLLAMA_BUILD_WEBUI=ON -DLLAMA_USE_PREBUILT_WEBUI=ON
+            -DLLAMA_BUILD_WEBUI=OFF
           cat build/CMakeFiles/*/CMakeSystem.cmake
           sed -i 's/aarch64/x86_64/' build/CMakeFiles/*/CMakeSystem.cmake
           sed -i '335s/${VERSION}/b9767/' scripts/ui-assets.cmake
