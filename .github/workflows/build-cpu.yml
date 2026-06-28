@@ -78,6 +78,7 @@ jobs:
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DGGML_RPC=OFF \
+            -DGGML_BACKEND_DL=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_CPU_ALL_VARIANTS=ON
           sed -i '335s/${VERSION}/b9767/' scripts/ui-assets.cmake
