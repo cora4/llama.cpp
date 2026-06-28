@@ -60,9 +60,9 @@ jobs:
             -DLLAMA_BUILD_WEBUI=OFF
           cat build/CMakeFiles/*/CMakeSystem.cmake
           sed -i 's/aarch64/x86_64/' build/CMakeFiles/*/CMakeSystem.cmake
-          sed -i 's/-DHF_VERSION=b1/-DHF_VERSION=b9767/' build/tools/ui/CMakeFiles/llama-ui-assets.dir/build.make
+          sed -i '335s/${VERSION}/b8929/' scripts/ui-assets.cmake
           echo after
-          cat build/CMakeFiles/*/CMakeSystem.cmake
+          cat build/CMakeFiles/*/CMakeSystem.cmake scripts/ui-assets.cmake
           time cmake --build build --config Release -j $(nproc)
           mkdir build2/
           mv build/bin/ build2/llama-b9767/
