@@ -1056,6 +1056,9 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
         __m512i acc_i32 = _mm512_setzero_si512();
 
+        float wsum0 = 0.0f;
+        float wsum1 = 0.0f;
+
     // ====================================================
     // PROCESS ALL 4 SUB-BLOCKS VECTORIALLY
     // ====================================================
@@ -1070,10 +1073,12 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const float d =
                 GGML_CPU_UE4M3_TO_FP32(xblk->d[s_idx]);
 
-            const __m512i yv = (s_idx < 2) ? y0v : y1v;
+            const int is_low =;
+
+            const __m512i yv = is_low ? y0v : y1v;
 
             const float dy =
-                GGML_CPU_FP16_TO_FP32((s_idx < 2) ? y0->d : y1->d);
+                GGML_CPU_FP16_TO_FP32(is_low ? y0->d : y1->d);
 
         // ------------------------------------------------
         // load 16 FP4 bytes → expand to 512-bit lanes
@@ -1104,20 +1109,28 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                                   _mm512_set1_epi16(1));
 
         // accumulate
-            __m512i acc_i32 = _mm512_setzero_si512();
             acc_i32 = _mm512_add_epi32(acc_i32, p);
 
         // ------------------------------------------------
-        // apply scalar weights at block granularity
+        // scalar weights separated (no dependency on acc_i32)
         // ------------------------------------------------
-            accum = _mm512_fmadd_ps(
-                _mm512_cvtepi32_ps(acc_i32),
-                _mm512_set1_ps(d * dy),
-                accum
-            );
+        float w = d * dy;
+
+        if (is_low) {
+            wsum0 += w;
+        } else {
+            wsum1 += w;
         }
     }
+    // ----------------------------------------------------
+    // finalize block
+    // ----------------------------------------------------
+    __m512 f = _mm512_cvtepi32_ps(acc_i32);
 
+    __m512 w = _mm512_set1_ps(wsum0 + wsum1);
+
+    accum = _mm512_fmadd_ps(f, w, accum);
+        
     *s = hsum_float_16(accum);
     return;
     
