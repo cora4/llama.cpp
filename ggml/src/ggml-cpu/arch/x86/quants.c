@@ -1016,7 +1016,71 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     int ib = 0;
     float sumf = 0;
 
-#if defined(__AVX2__)
+#if defined(__AVX512VNNI__)
+
+    const __m128i lut128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
+    const __m512i lut512 = _mm512_broadcast_i32x4(lut128);
+
+    __m512 acc = _mm512_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+
+        const block_nvfp4 * xb = &x[ib];
+        const block_q8_0   * y0 = &y[2*ib + 0];
+        const block_q8_0   * y1 = &y[2*ib + 1];
+
+        __m512 acc_ib = _mm512_setzero_ps();
+
+        for (int s = 0; s < 4; ++s) {
+
+            const float d =
+                GGML_CPU_UE4M3_TO_FP32(xb->d[s]);
+
+            const int q8_block = s >> 1;
+            const int q8_off   = (s & 1) * QK_NVFP4_SUB;
+
+            const float dy =
+                GGML_CPU_FP16_TO_FP32(
+                    (q8_block == 0 ? y0 : y1)->d
+                );
+
+            const __m512 scale =
+                _mm512_set1_ps(d * dy);
+
+            const __m128i q4 =
+                _mm_loadu_si128((const void*)(xb->qs + s * (QK_NVFP4_SUB / 2)));
+
+            const __m512i q8 =
+                _mm512_loadu_si512(
+                    (const void*)((q8_block == 0 ? y0 : y1)->qs + q8_off)
+                );
+
+            const __m512i q4_bytes =
+                _mm512_shuffle_epi8(
+                    lut512,
+                    _mm512_broadcast_i32x4(q4)
+                );
+
+            const __m512i dot =
+                _mm512_dpbssd_epi32(
+                    _mm512_setzero_si512(),
+                    q4_bytes,
+                    q8
+                );
+
+            const __m512 fp =
+                _mm512_cvtepi32_ps(dot);
+
+            acc_ib = _mm512_fmadd_ps(fp, scale, acc_ib);
+        }
+
+        acc = _mm512_add_ps(acc, acc_ib);
+    }
+
+    *s = _mm512_reduce_add_ps(acc);
+    return;
+
+#elif defined(__AVX2__)
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
