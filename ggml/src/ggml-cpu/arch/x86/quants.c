@@ -1121,6 +1121,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         } else {
             wsum1 += w;
         }
+        }
     }
     // ----------------------------------------------------
     // finalize block
