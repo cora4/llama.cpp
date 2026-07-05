@@ -140,6 +140,7 @@ jobs:
             -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }} \
             ${{ env.CMAKE_ARGS }}
           sed -i '335s/${VERSION}/b9855/' scripts/ui-assets.cmake
+          sed -i '54s/-O2/-O2 -static/' tools/ui/CMakeLists.txt
           sed -i '281s/COMMAND/COMMAND qemu-x86_64-static/' scripts/ui-assets.cmake
           sed -i 's/aarch64/x86_64/' build/CMakeFiles/*/CMakeSystem.cmake
           cmake --build build --config Release -j $(nproc)
