@@ -88,8 +88,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - build: 'x86'
-            os: ubuntu-24.04
+          - build: 'arm64'
+            os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
 
@@ -118,7 +118,7 @@ jobs:
       - name: Toolchain workaround (GCC 14)
         if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
         run: |
-          sudo apt-get install -y gcc-14-x86-64-linux-gnu g++-14-x86-64-linux-gnu
+          sudo apt-get install -y gcc-14-x86-64-linux-gnu g++-14-x86-64-linux-gnu qemu-user
           echo "CC=x86_64-linux-gnu-gcc-14" >> "$GITHUB_ENV"
           echo "CXX=x86_64-linux-gnu-g++-14" >> "$GITHUB_ENV"
       - name: ccache
@@ -140,6 +140,7 @@ jobs:
             -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }} \
             ${{ env.CMAKE_ARGS }}
           sed -i '335s/${VERSION}/b9855/' scripts/ui-assets.cmake
+          sed -i '281s/COMMAND/COMMAND qemu-x86_64/' scripts/ui-assets.cmake
           sed -i 's/aarch64/x86_64/' build/CMakeFiles/*/CMakeSystem.cmake
           cmake --build build --config Release -j $(nproc)
       - name: ccache-clear
