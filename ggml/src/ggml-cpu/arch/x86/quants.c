@@ -1073,7 +1073,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const float d =
                 GGML_CPU_UE4M3_TO_FP32(xblk->d[s_idx]);
 
-            const int is_low =;
+            const int is_low = (s_idx < 2);
 
             const __m512i yv = is_low ? y0v : y1v;
 
