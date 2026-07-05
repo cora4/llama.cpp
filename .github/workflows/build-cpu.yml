@@ -88,8 +88,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - build: 'arm64'
-            os: ubuntu-24.04-arm
+          - build: 'x86'
+            os: ubuntu-24.04
 
     runs-on: ${{ matrix.os }}
 
@@ -118,12 +118,7 @@ jobs:
       - name: Toolchain workaround (GCC 14)
         if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
         run: |
-          sudo ln -s /usr/lib64/ld-linux-x86-64.so.2 /lib64/
-          ls -lh /lib/x86_64-linux-gnu/libc.so.6 /lib64/ld-linux-x86-64.so.2
-          sudo apt-get install -y gcc-14-x86-64-linux-gnu g++-14-x86-64-linux-gnu qemu-user-static
-          wget http://mirrors.kernel.org/ubuntu/pool/main/g/glibc/libc6_2.43-2ubuntu2_amd64.deb
-          echo $PWD
-          sudo dpkg-deb -x $PWD/libc6_2.43-2ubuntu2_amd64.deb /
+          sudo apt-get install -y gcc-14-x86-64-linux-gnu g++-14-x86-64-linux-gnu
           echo "CC=x86_64-linux-gnu-gcc-14" >> "$GITHUB_ENV"
           echo "CXX=x86_64-linux-gnu-g++-14" >> "$GITHUB_ENV"
       - name: ccache
@@ -145,8 +140,6 @@ jobs:
             -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }} \
             ${{ env.CMAKE_ARGS }}
           sed -i '335s/${VERSION}/b9855/' scripts/ui-assets.cmake
-          # sed -i '54s/-O2/-O2 -static/' tools/ui/CMakeLists.txt
-          sed -i '281s/COMMAND/COMMAND qemu-x86_64-static/' scripts/ui-assets.cmake
           sed -i 's/aarch64/x86_64/' build/CMakeFiles/*/CMakeSystem.cmake
           cmake --build build --config Release -j $(nproc)
       - name: ccache-clear
@@ -154,6 +147,21 @@ jobs:
         uses: ./.github/actions/ccache-clear
         with:
           key: release-${{ matrix.os }}-cpu
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-ubuntu-${{ matrix.build }}.tar.gz --transform "s,^\.,llama-${{ steps.tag.outputs.name }}," -C ./build/bin .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-${{ matrix.build }}.tar.gz
+          name: llama-bin-ubuntu-${{ matrix.build }}.tar.gz
 
       - name: Determine tag name
         id: tag
