@@ -1023,7 +1023,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     __m512 acc = _mm512_setzero_ps();
 
-    for (int ib = 0; ib < nb; ++ib) {
+    for (; ib < nb; ++ib) {
 
         const block_nvfp4 * xb = &x[ib];
         const block_q8_0   * y0 = &y[2*ib + 0];
@@ -1031,13 +1031,13 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
         __m512 acc_ib = _mm512_setzero_ps();
 
-        for (int s = 0; s < 4; ++s) {
+        for (int s_idx = 0; s_idx < 4; ++s_idx) {
 
             const float d =
-                GGML_CPU_UE4M3_TO_FP32(xb->d[s]);
+                GGML_CPU_UE4M3_TO_FP32(xb->d[s_idx]);
 
-            const int q8_block = s >> 1;
-            const int q8_off   = (s & 1) * QK_NVFP4_SUB;
+            const int q8_block = s_idx >> 1;
+            const int q8_off   = (s_idx & 1) * QK_NVFP4_SUB;
 
             const float dy =
                 GGML_CPU_FP16_TO_FP32(
@@ -1048,7 +1048,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 _mm512_set1_ps(d * dy);
 
             const __m128i q4 =
-                _mm_loadu_si128((const void*)(xb->qs + s * (QK_NVFP4_SUB / 2)));
+                _mm_loadu_si128((const void*)(xb->qs + s_idx * (QK_NVFP4_SUB / 2)));
 
             const __m512i q8 =
                 _mm512_loadu_si512(
@@ -1062,7 +1062,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 );
 
             const __m512i dot =
-                _mm512_dpbssd_epi32(
+                _mm512_dpbusd_epi32(
                     _mm512_setzero_si512(),
                     q4_bytes,
                     q8
