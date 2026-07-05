@@ -1080,47 +1080,47 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const float dy =
                 GGML_CPU_FP16_TO_FP32(is_low ? y0->d : y1->d);
 
-        // ------------------------------------------------
-        // load 16 FP4 bytes → expand to 512-bit lanes
-        // ------------------------------------------------
+            // ------------------------------------------------
+            // load 16 FP4 bytes → expand to 512-bit lanes
+            // ------------------------------------------------
             __m256i q8 = _mm256_loadu_si256((const __m256i*)qs);
             __m512i qv = _mm512_cvtepu8_epi16(q8);
 
-        // ------------------------------------------------
-        // nibble split (VBMI2-friendly, no sign tricks)
-        // ------------------------------------------------
+            // ------------------------------------------------
+            // nibble split (VBMI2-friendly, no sign tricks)
+            // ------------------------------------------------
             __m512i lo = _mm512_and_si512(qv, mask4);
             __m512i hi = _mm512_and_si512(_mm512_srli_epi16(qv, 4), mask4);
 
-        // ------------------------------------------------
-        // LUT expansion
-        // ------------------------------------------------
+            // ------------------------------------------------
+            // LUT expansion
+            // ------------------------------------------------
             __m512i v_lo = _mm512_shuffle_epi8(lut, lo);
             __m512i v_hi = _mm512_shuffle_epi8(lut, hi);
 
             __m512i q4 = _mm512_or_si512(v_lo,
                                          _mm512_slli_epi16(v_hi, 4));
 
-        // ------------------------------------------------
-        // DOT PRODUCT CORE (unchanged math model)
-        // ------------------------------------------------
+            // ------------------------------------------------
+            // DOT PRODUCT CORE (unchanged math model)
+            // ------------------------------------------------
             __m512i p = _mm512_maddubs_epi16(q4, yv);
             p = _mm512_madd_epi16(p,
                                   _mm512_set1_epi16(1));
 
-        // accumulate
+            // accumulate
             acc_i32 = _mm512_add_epi32(acc_i32, p);
 
-        // ------------------------------------------------
-        // scalar weights separated (no dependency on acc_i32)
-        // ------------------------------------------------
-        float w = d * dy;
+            // ------------------------------------------------
+            // scalar weights separated (no dependency on acc_i32)
+            // ------------------------------------------------
+            float w = d * dy;
 
-        if (is_low) {
-            wsum0 += w;
-        } else {
-            wsum1 += w;
-        }
+            if (is_low) {
+                wsum0 += w;
+            } else {
+                wsum1 += w;
+            }
         }
     }
     // ----------------------------------------------------
