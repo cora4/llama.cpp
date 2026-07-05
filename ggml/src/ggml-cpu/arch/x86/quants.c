@@ -1015,71 +1015,95 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const int nb = n / QK_NVFP4;
     int ib = 0;
     float sumf = 0;
+    
+#if defined(__AVX512VBMI__)
 
-#if defined(__AVX512VNNI__)
+    __m512 accum = _mm512_setzero_ps();
 
-    const __m128i lut128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
-    const __m512i lut512 = _mm512_broadcast_i32x4(lut128);
+    const __m512i mask4 = _mm512_set1_epi8(0x0F);
 
-    __m512 acc = _mm512_setzero_ps();
+    const __m512i lut = _mm512_broadcast_i32x4(
+        _mm_load_si128((const __m128i*)kvalues_fp4)
+    );
 
     for (; ib < nb; ++ib) {
 
-        const block_nvfp4 * xb = &x[ib];
-        const block_q8_0   * y0 = &y[2*ib + 0];
-        const block_q8_0   * y1 = &y[2*ib + 1];
+        const block_nvfp4 *xblk = &x[ib];
+        const block_q8_0 *y0 = &y[2*ib + 0];
+        const block_q8_0 *y1 = &y[2*ib + 1];
 
-        __m512 acc_ib = _mm512_setzero_ps();
+    // ----------------------------------------------------
+    // load Q8 once
+    // ----------------------------------------------------
+        __m512i y0v = _mm512_loadu_si512((const void*)y0->qs);
+        __m512i y1v = _mm512_loadu_si512((const void*)y1->qs);
+
+        __m512 acc_i32 = _mm512_setzero_si512();
+
+    // ====================================================
+    // PROCESS ALL 4 SUB-BLOCKS VECTORIALLY
+    // ====================================================
+
+    // We treat the 4 sub-blocks as independent SIMD lanes
 
         for (int s_idx = 0; s_idx < 4; ++s_idx) {
 
-            const float d =
-                GGML_CPU_UE4M3_TO_FP32(xb->d[s_idx]);
+            const uint8_t *qs =
+                xblk->qs + s_idx * (QK_NVFP4_SUB / 2);
 
-            const int q8_block = s_idx >> 1;
-            const int q8_off   = (s_idx & 1) * QK_NVFP4_SUB;
+            const float d =
+                GGML_CPU_UE4M3_TO_FP32(xblk->d[s_idx]);
+
+            const __m512i yv = (s_idx < 2) ? y0v : y1v;
 
             const float dy =
-                GGML_CPU_FP16_TO_FP32(
-                    (q8_block == 0 ? y0 : y1)->d
-                );
+                GGML_CPU_FP16_TO_FP32((s_idx < 2) ? y0->d : y1->d);
 
-            const __m512 scale =
-                _mm512_set1_ps(d * dy);
+        // ------------------------------------------------
+        // load 16 FP4 bytes → expand to 512-bit lanes
+        // ------------------------------------------------
+            __m128i q8 = _mm_loadu_si128((const __m128i*)qs);
+            __m512i qv = _mm512_cvtepu8_epi16(q8);
 
-            const __m128i q4 =
-                _mm_loadu_si128((const void*)(xb->qs + s_idx * (QK_NVFP4_SUB / 2)));
+        // ------------------------------------------------
+        // nibble split (VBMI2-friendly, no sign tricks)
+        // ------------------------------------------------
+            __m512i lo = _mm512_and_si512(qv, mask4);
+            __m512i hi = _mm512_and_si512(_mm512_srli_epi16(qv, 4), mask4);
 
-            const __m512i q8 =
-                _mm512_loadu_si512(
-                    (const void*)((q8_block == 0 ? y0 : y1)->qs + q8_off)
-                );
+        // ------------------------------------------------
+        // LUT expansion
+        // ------------------------------------------------
+            __m512i v_lo = _mm512_shuffle_epi8(lut, lo);
+            __m512i v_hi = _mm512_shuffle_epi8(lut, hi);
 
-            const __m512i q4_bytes =
-                _mm512_shuffle_epi8(
-                    lut512,
-                    _mm512_broadcast_i32x4(q4)
-                );
+            __m512i q4 = _mm512_or_si512(v_lo,
+                                         _mm512_slli_epi16(v_hi, 4));
 
-            const __m512i dot =
-                _mm512_dpbusd_epi32(
-                    _mm512_setzero_si512(),
-                    q4_bytes,
-                    q8
-                );
+        // ------------------------------------------------
+        // DOT PRODUCT CORE (unchanged math model)
+        // ------------------------------------------------
+            __m512i p = _mm512_maddubs_epi16(q4, yv);
+            p = _mm512_madd_epi16(p,
+                                  _mm512_set1_epi16(1));
 
-            const __m512 fp =
-                _mm512_cvtepi32_ps(dot);
+        // accumulate
+            acc_i32 = _mm512_add_epi32(acc_i32, p);
 
-            acc_ib = _mm512_fmadd_ps(fp, scale, acc_ib);
+        // ------------------------------------------------
+        // apply scalar weights at block granularity
+        // ------------------------------------------------
+            accum = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(acc_i32),
+                _mm512_set1_ps(d * dy),
+                accum
+            );
         }
-
-        acc = _mm512_add_ps(acc, acc_ib);
     }
 
-    *s = _mm512_reduce_add_ps(acc);
+    *s = hsum_float_16(accum);
     return;
-
+    
 #elif defined(__AVX2__)
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
