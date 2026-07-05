@@ -1078,7 +1078,6 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         // ------------------------------------------------
         // load 16 FP4 bytes → expand to 512-bit lanes
         // ------------------------------------------------
-            __m128i q8 = _mm_loadu_si128((const __m128i*)qs);
             __m256i q8 = _mm256_loadu_si256((const __m256i*)qs);
             __m512i qv = _mm512_cvtepu8_epi16(q8);
 
