@@ -66,6 +66,22 @@ static inline int hsum_i32_4(const __m128i a) {
 }
 
 #if defined(__AVX2__) || defined(__AVX512F__)
+static inline float hsum_float_16(const __m512 x) {
+    __m256 lo = _mm512_castps512_ps256(x);
+    __m256 hi = _mm512_extractf32x8_ps(x, 1);
+
+    __m256 sum = _mm256_add_ps(lo, hi);
+
+    __m256 t1 = _mm256_hadd_ps(sum, sum);
+    __m256 t2 = _mm256_hadd_ps(t1, t1);
+
+    __m128 t3 = _mm256_castps256_ps128(t2);
+    __m128 t4 = _mm_movehl_ps(t3, t3);
+    __m128 t5 = _mm_add_ps(t3, t4);
+
+    return _mm_cvtss_f32(t5);
+}
+
 static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
@@ -1038,7 +1054,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         __m512i y0v = _mm512_loadu_si512((const void*)y0->qs);
         __m512i y1v = _mm512_loadu_si512((const void*)y1->qs);
 
-        __m512 acc_i32 = _mm512_setzero_si512();
+        __m512i acc_i32 = _mm512_setzero_si512();
 
     // ====================================================
     // PROCESS ALL 4 SUB-BLOCKS VECTORIALLY
@@ -1063,6 +1079,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         // load 16 FP4 bytes → expand to 512-bit lanes
         // ------------------------------------------------
             __m128i q8 = _mm_loadu_si128((const __m128i*)qs);
+            __m256i q8 = _mm256_loadu_si256((const __m256i*)qs);
             __m512i qv = _mm512_cvtepu8_epi16(q8);
 
         // ------------------------------------------------
@@ -1088,6 +1105,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                                   _mm512_set1_epi16(1));
 
         // accumulate
+            __m512i acc_i32 = _mm512_setzero_si512();
             acc_i32 = _mm512_add_epi32(acc_i32, p);
 
         // ------------------------------------------------
