@@ -119,6 +119,9 @@ jobs:
         if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
         run: |
           sudo apt-get install -y gcc-14-x86-64-linux-gnu g++-14-x86-64-linux-gnu qemu-user-static
+          wget http://mirrors.kernel.org/ubuntu/pool/main/g/glibc/libc6_2.43-2ubuntu2_amd64.deb
+          echo $PWD
+          sudo dpkg-deb -x $PWD/libc6_2.43-2ubuntu2_amd64.deb /
           echo "CC=x86_64-linux-gnu-gcc-14" >> "$GITHUB_ENV"
           echo "CXX=x86_64-linux-gnu-g++-14" >> "$GITHUB_ENV"
       - name: ccache
@@ -140,7 +143,7 @@ jobs:
             -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }} \
             ${{ env.CMAKE_ARGS }}
           sed -i '335s/${VERSION}/b9855/' scripts/ui-assets.cmake
-          sed -i '54s/-O2/-O2 -static/' tools/ui/CMakeLists.txt
+          # sed -i '54s/-O2/-O2 -static/' tools/ui/CMakeLists.txt
           sed -i '281s/COMMAND/COMMAND qemu-x86_64-static/' scripts/ui-assets.cmake
           sed -i 's/aarch64/x86_64/' build/CMakeFiles/*/CMakeSystem.cmake
           cmake --build build --config Release -j $(nproc)
