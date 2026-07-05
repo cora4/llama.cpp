@@ -1122,7 +1122,6 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 wsum1 += w;
             }
         }
-    }
     // ----------------------------------------------------
     // finalize block
     // ----------------------------------------------------
@@ -1131,7 +1130,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     __m512 w = _mm512_set1_ps(wsum0 + wsum1);
 
     accum = _mm512_fmadd_ps(f, w, accum);
-        
+    }
     *s = hsum_float_16(accum);
     return;
     
