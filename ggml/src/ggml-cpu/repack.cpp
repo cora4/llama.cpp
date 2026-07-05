@@ -1,4 +1,4 @@
-#define GGML_COMMON_IMPL_CPP
+.#define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
 #include "ggml-backend-impl.h"
@@ -2757,9 +2757,11 @@ static block_q4_0x4 make_block_q4_0x4(block_q4_0 * in, unsigned int blck_size_in
 
             uint64_t elems;
             // Using memcpy to avoid unaligned memory accesses
-            memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
+//            memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
+            std::memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
             elems ^= xor_mask;
-            memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
+//            memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
+            std::memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
         }
     } else if (blck_size_interleave == 4) {
         const uint32_t xor_mask = 0x88888888;
@@ -2769,9 +2771,11 @@ static block_q4_0x4 make_block_q4_0x4(block_q4_0 * in, unsigned int blck_size_in
             int dst_offset = i * blck_size_interleave;
 
             uint32_t elems;
-            memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint32_t));
+//            memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint32_t));
+            std::memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint32_t));
             elems ^= xor_mask;
-            memcpy(&out.qs[dst_offset], &elems, sizeof(uint32_t));
+//            memcpy(&out.qs[dst_offset], &elems, sizeof(uint32_t));
+            std::memcpy(&out.qs[dst_offset], &elems, sizeof(uint32_t));
         }
     } else {
         GGML_ASSERT(false);
@@ -2800,9 +2804,11 @@ static block_q4_0x8 make_block_q4_0x8(block_q4_0 * in, unsigned int blck_size_in
         int dst_offset = i * blck_size_interleave;
 
         uint64_t elems;
-        memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
+//        memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
+        std::memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
         elems ^= xor_mask;
-        memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
+//        memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
+        std::memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
     }
 
     return out;
@@ -2854,8 +2860,10 @@ static block_q4_Kx8 make_block_q4_Kx8(block_q4_K * in, unsigned int blck_size_in
 
         // buffer large enough for the max interleave block size (8 bytes)
         uint64_t elems;
-        memcpy(&elems, &in[src_id].qs[src_offset], blck_size_interleave);
-        memcpy(&out.qs[dst_offset], &elems, blck_size_interleave);
+//        memcpy(&elems, &in[src_id].qs[src_offset], blck_size_interleave);
+//        memcpy(&out.qs[dst_offset], &elems, blck_size_interleave);
+        std::memcpy(&elems, &in[src_id].qs[src_offset], sizeof(uint64_t));
+        std::memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
     }
 
     // The below logic is designed so as to unpack and rearrange scales and mins values in Q4_K
