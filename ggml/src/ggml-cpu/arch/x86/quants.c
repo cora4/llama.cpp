@@ -1035,25 +1035,6 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 }
 
 #if defined(__AVX512VBMI__)
-static inline __m512i decode_fp4_32(const uint8_t *qs,
-                                    const __m512i lut,
-                                    const __m512i mask4)
-{
-    __m256i x = _mm256_loadu_si256((const __m256i*)qs);
-    __m512i v = _mm512_cvtepu8_epi16(x);
-
-    __m512i lo = _mm512_and_si512(v, mask4);
-    __m512i hi = _mm512_and_si512(_mm512_srli_epi16(v, 4), mask4);
-
-    __m512i v_lo = _mm512_shuffle_epi8(lut, lo);
-    __m512i v_hi = _mm512_shuffle_epi8(lut, hi);
-
-    // match AVX2: interleave low/high decoded nibbles
-    __m512i a = _mm512_unpacklo_epi8(v_lo, v_hi);
-    __m512i b = _mm512_unpackhi_epi8(v_lo, v_hi);
-
-    return _mm512_unpacklo_epi16(a, b);
-}
 #endif
 
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -1131,6 +1112,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = hsum_float_16(accum);
+    break;
     
 #elif defined(__AVX2__)
 
