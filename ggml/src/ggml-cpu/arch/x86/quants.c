@@ -88,6 +88,20 @@ static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
     return _mm256_maddubs_epi16(ax, sy);
 }
 
+static inline __m512i mul_add_epi8_512(__m512i x, __m512i y)
+{
+    // abs(x)
+    __m512i ax = _mm512_abs_epi8(x);
+
+    // sign trick: y with sign(x)
+    __mmask64 sign = _mm512_movepi8_mask(x);
+    __m512i ny = _mm512_sub_epi8(_mm512_setzero_si512(), y);
+    __m512i sy = _mm512_mask_blend_epi8(sign, y, ny);
+
+    __m512i p = _mm512_maddubs_epi16(ax, sy);
+    return p;
+}
+
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
 static inline __m256i bytes_from_bits_32(const uint8_t * x) {
     uint32_t x32;
@@ -1094,7 +1108,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             // =========================================================
             // ORIGINAL AVX2 MATH (DO NOT CHANGE — THIS IS THE KEY)
             // =========================================================
-            __m512i p = mul_add_epi8(q4, yv);
+            __m512i p = mul_add_epi8_512(q4, yv);
             p = _mm512_madd_epi16(p, ones);
 
             if (s_idx < 2)
