@@ -1131,7 +1131,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = hsum_float_16(accum);
-    
+}
 #elif defined(__AVX2__) || defined(__AVX__)
 #if defined(__AVX2__)
 
@@ -1254,8 +1254,8 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         }
     }
     *s = sumf;
-#endif
 }
+#endif
 
 void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
