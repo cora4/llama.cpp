@@ -1069,7 +1069,6 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const int nb = n / QK_NVFP4;
     int ib = 0;
-    float sumf = 0;
     
 #if defined(__AVX512VBMI__)
 
@@ -1133,6 +1132,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = hsum_float_16(accum);
 }
 #else
+    float sumf = 0;
 #if defined(__AVX2__)
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
