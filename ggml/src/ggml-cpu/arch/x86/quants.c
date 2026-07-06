@@ -1069,124 +1069,60 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const int nb = n / QK_NVFP4;
     int ib = 0;
-    
-#if defined(__AVX512VBMI__)
-    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
-    const __m128i m4b  = _mm_set1_epi8(0x0f);
-    
-    // Use 4 independent accumulators to hide 4-cycle FMA latency
-    __m512 accum[4] = {
-        _mm512_setzero_ps(),
-        _mm512_setzero_ps(),
-        _mm512_setzero_ps(),
-        _mm512_setzero_ps()
-    };
-    
-    int block_idx = 0;
-    for (; ib < nb - 3; ib += 4) {
-        // Process 4 blocks in parallel (each block has 64 elements = 32 pairs)
-        for (int b = 0; b < 4; ++b) {
-            // Load 32-byte (64 nibble) FP4 quantized values
-            const __m256i q4bits_01 = _mm256_loadu_si256((const __m256i *)(x[ib+b].qs + 0));
-            const __m256i q4bits_23 = _mm256_loadu_si256((const __m256i *)(x[ib+b].qs + 16));
-            
-            // Load 64 int8 values (2 blocks of y, each has 32 values)
-            const __m512i q8_01 = _mm512_loadu_si512((const __m512i *)y[2*(ib+b) + 0].qs);
-            const __m512i q8_23 = _mm512_loadu_si512((const __m512i *)y[2*(ib+b) + 1].qs);
-            
-            // Unpack 4-bit values to 8-bit (32 values -> 32x8bit each)
-            const __m256i q4_01_lo = _mm256_shuffle_epi8(
-                _mm256_cvtepi128_epi256(values128),
-                _mm256_and_si256(q4bits_01, _mm256_set1_epi8(0x0f))
-            );
-            const __m256i q4_01_hi = _mm256_shuffle_epi8(
-                _mm256_cvtepi128_epi256(values128),
-                _mm256_and_si256(_mm256_srli_epi16(q4bits_01, 4), _mm256_set1_epi8(0x0f))
-            );
-            
-            const __m256i q4_23_lo = _mm256_shuffle_epi8(
-                _mm256_cvtepi128_epi256(values128),
-                _mm256_and_si256(q4bits_23, _mm256_set1_epi8(0x0f))
-            );
-            const __m256i q4_23_hi = _mm256_shuffle_epi8(
-                _mm256_cvtepi128_epi256(values128),
-                _mm256_and_si256(_mm256_srli_epi16(q4bits_23, 4), _mm256_set1_epi8(0x0f))
-            );
-            
-            // Interleave to get 64 int8 values in 512-bit form
-            __m512i q4_01 = _mm512_inserti64x4(
-                _mm512_castsi256_si512(
-                    _mm256_permute4x64_epi64(
-                        _mm256_unpacklo_epi64(q4_01_lo, q4_01_hi), 0xd8
-                    )
-                ),
-                _mm256_permute4x64_epi64(
-                    _mm256_unpackhi_epi64(q4_01_lo, q4_01_hi), 0xd8
-                ),
-                1
-            );
-            
-            __m512i q4_23 = _mm512_inserti64x4(
-                _mm512_castsi256_si512(
-                    _mm256_permute4x64_epi64(
-                        _mm256_unpacklo_epi64(q4_23_lo, q4_23_hi), 0xd8
-                    )
-                ),
-                _mm256_permute4x64_epi64(
-                    _mm256_unpackhi_epi64(q4_23_lo, q4_23_hi), 0xd8
-                ),
-                1
-            );
-            
-            // Signed multiply-add with masking
-            __m512i p01 = mul_add_epi8_512(q4_01, q8_01);
-            __m512i p23 = mul_add_epi8_512(q4_23, q8_23);
-            
-            // Horizontal sum of int16 pairs -> int32 (32 values)
-            __m512i p01_32 = _mm512_cvtepi16_epi32(_mm512_cvtepi32_epi16(p01));
-            __m512i p23_32 = _mm512_cvtepi16_epi32(_mm512_cvtepi32_epi16(p23));
-            
-            // Convert to float
-            __m512 p01_f = _mm512_cvtepi32_ps(p01_32);
-            __m512 p23_f = _mm512_cvtepi32_ps(p23_32);
-            
-            // Load scales
-            const float dy0 = GGML_CPU_FP16_TO_FP32(y[2*(ib+b)].d);
-            const float dy1 = GGML_CPU_FP16_TO_FP32(y[2*(ib+b)+1].d);
-            
-            const float s0 = GGML_CPU_UE4M3_TO_FP32(x[ib+b].d[0]) * dy0;
-            const float s1 = GGML_CPU_UE4M3_TO_FP32(x[ib+b].d[1]) * dy0;
-            const float s2 = GGML_CPU_UE4M3_TO_FP32(x[ib+b].d[2]) * dy1;
-            const float s3 = GGML_CPU_UE4M3_TO_FP32(x[ib+b].d[3]) * dy1;
-            
-            const __m512 scales01 = _mm512_set_ps(
-                s1, s1, s1, s1, s1, s1, s1, s1,
-                s0, s0, s0, s0, s0, s0, s0, s0
-            );
-            const __m512 scales23 = _mm512_set_ps(
-                s3, s3, s3, s3, s3, s3, s3, s3,
-                s2, s2, s2, s2, s2, s2, s2, s2
-            );
-            
-            // Accumulate using 4 independent FMAs (hide latency)
-            accum[b] = _mm512_fmadd_ps(scales01, p01_f, accum[b]);
-            accum[b] = _mm512_fmadd_ps(scales23, p23_f, accum[b]);
-        }
-    }
-    
-    // Handle remaining blocks
-    for (; ib < nb; ++ib) {
-        // ... scalar fallback for remaining blocks
-    }
-    
-    // Combine 4 accumulators
-    __m512 final_accum = _mm512_add_ps(
-        _mm512_add_ps(accum[0], accum[1]),
-        _mm512_add_ps(accum[2], accum[3])
-    );
-    sumf = _mm512_reduce_add_ps(final_accum);
-#else
     float sumf = 0;
+#if defined(__AVX512VBMI__)
+    alignas(64) static const int8_t kvalues_fp4_512[64] = {
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    const __m512i table = _mm512_loadu_si512(kvalues_fp4_512);
+    __m512 accum = _mm512_setzero_ps();
+    for (; ib < nb; ++ib) {
+        // Block q4 expansion using VBMI VPERMB
+        const __m256i qs_packed = _mm256_loadu_si256((const __m256i *)(x[ib].qs)); // 32 bytes
+
+        __m256i low_nibbles = _mm256_and_si256(qs_packed, _mm256_set1_epi8(0x0f));
+        __m256i high_nibbles = _mm256_srli_epi16(qs_packed, 4);
+        high_nibbles = _mm256_and_si256(high_nibbles, _mm256_set1_epi8(0x0f));
+
+        uint8_t indices[64];
+        _mm256_storeu_si256((__m256i*)indices, low_nibbles);
+        _mm256_storeu_si256((__m256i*)(indices + 32), high_nibbles);
+
+        const __m512i index_vec = _mm512_loadu_si512(indices);
+        const __m512i q4 = _mm512_permutexvar_epi8(index_vec, table);
+
+        // Block q8 expansion
+        const __m512i q8_01 = _mm512_loadu_si512((const __m512i *)y[2*ib+0].qs);
+        const __m512i q8_23 = _mm512_loadu_si512((const __m512i *)y[2*ib+1].qs);
+
+        // Slice q4 into two 32-byte halves for pairwise multiply
+        __m256i q4_01 = _mm512_extracti32x8_epi32(q4, 0);
+        __m256i q4_23 = _mm512_extracti32x8_epi32(q4, 1);
+
+        const __m512i p01 = mul_add_epi8_512(q4_01, q8_01);
+        const __m512i p23 = mul_add_epi8_512(q4_23, q8_23);
+
+        const __m512 p01f = _mm512_cvtepi32_ps(_mm512_madd_epi16(p01, _mm512_set1_epi16(1)));
+        const __m512 p23f = _mm512_cvtepi32_ps(_mm512_madd_epi16(p23, _mm512_set1_epi16(1)));
+
+        // Load scales
+        float dy0 = GGML_CPU_FP16_TO_FP32(y[2*ib+0].d);
+        float dy1 = GGML_CPU_FP16_TO_FP32(y[2*ib+1].d);
+        float s0 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[0]) * dy0;
+        float s1 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[1]) * dy0;
+        float s2 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[2]) * dy1;
+        float s3 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[3]) * dy1;
+        __m512 scales01 = _mm512_set_ps(s1,s1,s1,s1,s1,s1,s1,s1,s0,s0,s0,s0,s0,s0,s0,s0);
+        __m512 scales23 = _mm512_set_ps(s3,s3,s3,s3,s3,s3,s3,s3,s2,s2,s2,s2,s2,s2,s2,s2);
+
+        accum = _mm512_fmadd_ps(scales01, p01f, accum);
+        accum = _mm512_fmadd_ps(scales23, p23f, accum);
+    }
+    sumf = hsum_float_16(accum);
+#else
 #if defined(__AVX2__)
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
