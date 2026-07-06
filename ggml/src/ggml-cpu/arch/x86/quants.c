@@ -1017,6 +1017,7 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
+#if defined(__AVX512VBMI__)
 static inline __m512i decode_fp4_32bytes(const uint8_t *qs, const __m512i lut, const __m512i mask4)
 {
     // load 32 packed bytes (one NVFP4 subblock pair)
@@ -1035,6 +1036,7 @@ static inline __m512i decode_fp4_32bytes(const uint8_t *qs, const __m512i lut, c
 
     return _mm512_unpacklo_epi16(interleaved_lo, interleaved_hi);
 }
+#endif
 
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
