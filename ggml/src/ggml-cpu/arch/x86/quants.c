@@ -65,7 +65,7 @@ static inline int hsum_i32_4(const __m128i a) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+#if __AVX512F__
 static inline float hsum_float_16(const __m512 x) {
     __m256 lo = _mm512_castps512_ps256(x);
     __m256 hi = _mm512_extractf32x8_ps(x, 1);
@@ -82,12 +82,6 @@ static inline float hsum_float_16(const __m512 x) {
     return _mm_cvtss_f32(t5);
 }
 
-static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
-    const __m256i ax = _mm256_sign_epi8(x, x);
-    const __m256i sy = _mm256_sign_epi8(y, x);
-    return _mm256_maddubs_epi16(ax, sy);
-}
-
 static inline __m512i mul_add_epi8_512(__m512i x, __m512i y)
 {
     // abs(x)
@@ -100,6 +94,15 @@ static inline __m512i mul_add_epi8_512(__m512i x, __m512i y)
 
     __m512i p = _mm512_maddubs_epi16(ax, sy);
     return p;
+}
+#endif
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+
+static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    return _mm256_maddubs_epi16(ax, sy);
 }
 
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
