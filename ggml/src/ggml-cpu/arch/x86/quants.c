@@ -1018,9 +1018,10 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 }
 
 #if defined(__AVX512VBMI__)
-static inline __m512i decode_fp4_32bytes(const uint8_t *qs, const __m512i lut, const __m512i mask4)
+static inline __m512i decode_fp4_32(const uint8_t *qs,
+                                    const __m512i lut,
+                                    const __m512i mask4)
 {
-    // load 32 packed bytes (one NVFP4 subblock pair)
     __m256i x = _mm256_loadu_si256((const __m256i*)qs);
     __m512i v = _mm512_cvtepu8_epi16(x);
 
@@ -1030,11 +1031,11 @@ static inline __m512i decode_fp4_32bytes(const uint8_t *qs, const __m512i lut, c
     __m512i v_lo = _mm512_shuffle_epi8(lut, lo);
     __m512i v_hi = _mm512_shuffle_epi8(lut, hi);
 
-    // IMPORTANT: match AVX2 unpack order (lo then hi interleaved)
-    __m512i interleaved_lo = _mm512_unpacklo_epi8(v_lo, v_hi);
-    __m512i interleaved_hi = _mm512_unpackhi_epi8(v_lo, v_hi);
+    // match AVX2: interleave low/high decoded nibbles
+    __m512i a = _mm512_unpacklo_epi8(v_lo, v_hi);
+    __m512i b = _mm512_unpackhi_epi8(v_lo, v_hi);
 
-    return _mm512_unpacklo_epi16(interleaved_lo, interleaved_hi);
+    return _mm512_unpacklo_epi16(a, b);
 }
 #endif
 
@@ -1067,44 +1068,43 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     for (; ib < nb; ++ib)
     {
         const block_nvfp4 *xblk = &x[ib];
-
         const block_q8_0 *y0 = &y[2*ib + 0];
         const block_q8_0 *y1 = &y[2*ib + 1];
 
         __m512i y0v = _mm512_loadu_si512((const void*)y0->qs);
         __m512i y1v = _mm512_loadu_si512((const void*)y1->qs);
 
-        __m512 acc_i32_01 = _mm512_setzero_si512();
-        __m512 acc_i32_23 = _mm512_setzero_si512();
+        __m512i acc01 = _mm512_setzero_si512();
+        __m512i acc23 = _mm512_setzero_si512();
 
         float s0 = GGML_CPU_UE4M3_TO_FP32(xblk->d[0]) * GGML_CPU_FP16_TO_FP32(y0->d);
         float s1 = GGML_CPU_UE4M3_TO_FP32(xblk->d[1]) * GGML_CPU_FP16_TO_FP32(y0->d);
         float s2 = GGML_CPU_UE4M3_TO_FP32(xblk->d[2]) * GGML_CPU_FP16_TO_FP32(y1->d);
         float s3 = GGML_CPU_UE4M3_TO_FP32(xblk->d[3]) * GGML_CPU_FP16_TO_FP32(y1->d);
 
-        for (int s = 0; s < 4; ++s)
+        for (int s_idx = 0; s_idx < 4; ++s_idx)
         {
-            const uint8_t *qs = xblk->qs + s * (QK_NVFP4_SUB / 2);
+            const uint8_t *qs =
+                xblk->qs + s_idx * (QK_NVFP4_SUB / 2);
 
-            __m512i q4 = decode_fp4_32bytes(qs, lut, mask4);
+            __m512i q4 = decode_fp4_32(qs, lut, mask4);
 
-            __m512i yv = (s < 2) ? y0v : y1v;
+            __m512i yv = (s_idx < 2) ? y0v : y1v;
 
-            // --- signed dot product via abs/sign trick ---
-            __m512i ax = _mm512_sign_epi8(q4, q4);
-            __m512i sy = _mm512_sign_epi8(yv, q4);
-
-            __m512i p = _mm512_maddubs_epi16(ax, sy);
+            // =========================================================
+            // ORIGINAL AVX2 MATH (DO NOT CHANGE — THIS IS THE KEY)
+            // =========================================================
+            __m512i p = mul_add_epi8(q4, yv);
             p = _mm512_madd_epi16(p, ones);
 
-            if (s < 2)
-                acc_i32_01 = _mm512_add_epi32(acc_i32_01, p);
+            if (s_idx < 2)
+                acc01 = _mm512_add_epi32(acc01, p);
             else
-                acc_i32_23 = _mm512_add_epi32(acc_i32_23, p);
+                acc23 = _mm512_add_epi32(acc23, p);
         }
 
-        __m512 f01 = _mm512_cvtepi32_ps(acc_i32_01);
-        __m512 f23 = _mm512_cvtepi32_ps(acc_i32_23);
+        __m512 f01 = _mm512_cvtepi32_ps(acc01);
+        __m512 f23 = _mm512_cvtepi32_ps(acc23);
 
         __m512 w01 = _mm512_set1_ps(s0 + s1);
         __m512 w23 = _mm512_set1_ps(s2 + s3);
@@ -1114,7 +1114,6 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = hsum_float_16(accum);
-    return;
     
 #elif defined(__AVX2__)
 
