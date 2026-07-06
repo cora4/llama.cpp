@@ -1132,8 +1132,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     *s = hsum_float_16(accum);
 }
-#elif defined(__AVX2__) || defined(__AVX__)
-#if defined(__AVX2__)
+#elif defined(__AVX2__)
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
@@ -1235,7 +1234,7 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     sumf = hsum_float_8(accum);
 
 #endif
-
+#if defined(__AVX2__) || defined(__AVX__)
     for (;ib < nb; ++ib) {
         for (int s_idx = 0; s_idx < 4; ++s_idx) {
             const float d = GGML_CPU_UE4M3_TO_FP32(x[ib].d[s_idx]);
