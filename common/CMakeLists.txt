@@ -1,5 +1,6 @@
 # common
 
+find_package(Threads REQUIRED)
 
 # Build info header
 #
@@ -36,7 +37,7 @@ add_custom_command(
     COMMENT "Generating build details from Git"
     COMMAND ${CMAKE_COMMAND} -DMSVC=${MSVC} -DCMAKE_C_COMPILER_VERSION=${CMAKE_C_COMPILER_VERSION}
             -DCMAKE_C_COMPILER_ID=${CMAKE_C_COMPILER_ID} -DCMAKE_VS_PLATFORM_NAME=${CMAKE_VS_PLATFORM_NAME}
-            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -P "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/gen-build-info-cpp.cmake"
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info-gen-cpp.cmake"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp.in" ${GIT_INDEX}
     VERBATIM
@@ -51,20 +52,59 @@ set(TARGET common)
 
 add_library(${TARGET} STATIC
     base64.hpp
-    common.h
+    chat-auto-parser-generator.cpp
+    chat-auto-parser-helpers.cpp
+    chat-auto-parser.h
+    chat-diff-analyzer.cpp
+	chat-peg-parser.cpp
+    chat-peg-parser.h
     common.cpp
     sampling.h
     sampling.cpp
     console.h
     console.cpp
-    grammar-parser.h
-    grammar-parser.cpp
-    json.hpp
+    json-partial.h
+    json-partial.cpp
+    llguidance.cpp
     json-schema-to-grammar.cpp
     train.h
     train.cpp
-    ngram-cache.h
+    log.cpp
+    log.h    
+    http.h
     ngram-cache.cpp
+    ngram-cache.h
+    ngram-map.cpp
+    ngram-map.h
+    peg-parser.cpp
+    peg-parser.h
+    speculative.cpp
+    spec-tuner.cpp
+    spec-tuner.h
+    unicode.cpp
+    unicode.h
+    ngram-mod.cpp
+    ngram-mod.h
+    suffix-tree.cpp
+    suffix-tree.h
+    regex-partial.cpp
+    regex-partial.h
+    reasoning-budget.cpp
+    reasoning-budget.h
+    chat.cpp
+    chat.h
+    jinja/lexer.cpp
+    jinja/lexer.h
+    jinja/parser.cpp
+    jinja/parser.h
+    jinja/runtime.cpp
+    jinja/runtime.h
+    jinja/value.cpp
+    jinja/value.h
+    jinja/string.cpp
+    jinja/string.h
+    jinja/caps.cpp
+    jinja/caps.h
     )
 
 if (BUILD_SHARED_LIBS)
@@ -82,6 +122,33 @@ if (LLAMA_CURL)
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${CURL_LIBRARY})
 endif ()
 
-target_include_directories(${TARGET} PUBLIC .)
-target_compile_features(${TARGET} PUBLIC cxx_std_11)
-target_link_libraries(${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+if (LLAMA_LLGUIDANCE)
+    include(ExternalProject)
+    set(LLGUIDANCE_SRC ${CMAKE_BINARY_DIR}/llguidance/source)
+    set(LLGUIDANCE_PATH ${LLGUIDANCE_SRC}/target/release)
+    ExternalProject_Add(llguidance_ext
+        GIT_REPOSITORY https://github.com/guidance-ai/llguidance
+        # v0.6.12:
+        GIT_TAG ced1c9023d47ec194fa977932d35ce65c2ebfc09
+        PREFIX ${CMAKE_BINARY_DIR}/llguidance
+        SOURCE_DIR ${LLGUIDANCE_SRC}
+        BUILD_IN_SOURCE TRUE
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND cargo build --release
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS ${LLGUIDANCE_PATH}/libllguidance.a ${LLGUIDANCE_PATH}/llguidance.h
+        UPDATE_COMMAND ""
+    )
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_LLGUIDANCE)
+
+    add_library(llguidance STATIC IMPORTED)
+    set_target_properties(llguidance PROPERTIES IMPORTED_LOCATION ${LLGUIDANCE_PATH}/libllguidance.a)
+    add_dependencies(llguidance llguidance_ext)
+
+    target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
+    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance)
+endif ()
+
+target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)

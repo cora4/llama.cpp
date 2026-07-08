@@ -76,7 +76,7 @@ static std::vector<chunk> chunk_file(const std::string & filename, int chunk_siz
 static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & tokens, llama_seq_id seq_id) {
     size_t n_tokens = tokens.size();
     for (size_t i = 0; i < n_tokens; i++) {
-        llama_batch_add(batch, tokens[i], i, { seq_id }, true);
+        common_batch_add(batch, tokens[i], i, { seq_id }, true);
     }
 }
 
@@ -106,7 +106,7 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
         }
 
         float * out = output + batch.seq_id[i][0] * n_embd;
-        llama_embd_normalize(embd, out, n_embd);
+        common_embd_normalize(embd, out, n_embd);
     }
 }
 
@@ -148,11 +148,12 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    llama_model * model;
-    llama_context * ctx;
-
     // load the model
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
+    llama_init_result llama_init = llama_init_from_gpt_params(params);
+
+    llama_model * model = llama_init.model;
+    llama_context * ctx = llama_init.context;
+
     if (model == NULL) {
         fprintf(stderr, "%s: error: unable to load model\n", __func__);
         return 1;
@@ -184,7 +185,7 @@ int main(int argc, char ** argv) {
 
     // tokenize the prompts and trim
     for (auto & chunk : chunks) {
-        auto inp = ::llama_tokenize(ctx, chunk.textdata, true, false);
+        auto inp = ::common_tokenize(ctx, chunk.textdata, true, false);
         if (inp.size() > n_batch) {
             fprintf(stderr, "%s: error: chunk size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
                     __func__, (long long int) inp.size(), (long long int) n_batch);
@@ -203,7 +204,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s: prompt %d: '%s'\n", __func__, i, chunks[i].textdata.c_str());
             fprintf(stderr, "%s: number of tokens in prompt = %zu\n", __func__, chunks[i].tokens.size());
             for (int j = 0; j < (int) chunks[i].tokens.size(); j++) {
-                fprintf(stderr, "%6d -> '%s'\n", chunks[i].tokens[j], llama_token_to_piece(ctx, chunks[i].tokens[j]).c_str());
+                fprintf(stderr, "%6d -> '%s'\n", chunks[i].tokens[j], common_token_to_piece(ctx, chunks[i].tokens[j]).c_str());
             }
             fprintf(stderr, "\n\n");
         }
@@ -214,7 +215,7 @@ int main(int argc, char ** argv) {
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
     // allocate output
-    const int n_embd = llama_n_embd(model);
+    const int n_embd = llama_model_n_embd(model);
     std::vector<float> embeddings(n_chunks * n_embd, 0);
     float * emb = embeddings.data();
 
@@ -231,7 +232,7 @@ int main(int argc, char ** argv) {
         if (batch.n_tokens + n_toks > n_batch) {
             float * out = emb + p * n_embd;
             batch_decode(ctx, batch, out, s, n_embd);
-            llama_batch_clear(batch);
+            common_batch_clear(batch);
             p += s;
             s = 0;
         }
@@ -257,7 +258,7 @@ int main(int argc, char ** argv) {
     while (true) {
         printf("Enter query: ");
         std::getline(std::cin, query);
-        std::vector<int32_t> query_tokens = llama_tokenize(ctx, query, true);
+        std::vector<int32_t> query_tokens = common_tokenize(ctx, query, true);
 
         struct llama_batch query_batch = llama_batch_init(n_batch, 0, 1);
         batch_add_seq(query_batch, query_tokens, 0);
@@ -265,13 +266,13 @@ int main(int argc, char ** argv) {
         std::vector<float> query_emb(n_embd, 0);
         batch_decode(ctx, query_batch, query_emb.data(), 1, n_embd);
 
-        llama_batch_clear(query_batch);
+        common_batch_clear(query_batch);
 
         // compute cosine similarities
         {
             std::vector<std::pair<int, float>> similarities;
             for (int i = 0; i < n_chunks; i++) {
-                float sim = llama_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd);
+                float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd);
                 similarities.push_back(std::make_pair(i, sim));
             }
 

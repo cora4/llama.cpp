@@ -31,7 +31,7 @@ int main(int argc, char ** argv) {
     int n_parallel = params.n_parallel;
 
     // total length of the sequences including the prompt
-    int n_predict = 32;
+    int n_predict = params.n_predict;
 
     // init LLM
 
@@ -40,9 +40,9 @@ int main(int argc, char ** argv) {
 
     // initialize the model
 
-    llama_model_params model_params = llama_model_params_from_gpt_params(params);
+    llama_model_params model_params = common_model_params_to_llama(params);
 
-    llama_model * model = llama_load_model_from_file(params.model.c_str(), model_params);
+    llama_model * model = llama_model_load_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {
         fprintf(stderr , "%s: error: unable to load model\n" , __func__);
@@ -52,18 +52,18 @@ int main(int argc, char ** argv) {
     // tokenize the prompt
 
     std::vector<llama_token> tokens_list;
-    tokens_list = ::llama_tokenize(model, params.prompt, true);
+    tokens_list = ::common_tokenize(model, params.prompt, true);
 
     const int n_kv_req = tokens_list.size() + (n_predict - tokens_list.size())*n_parallel;
 
     // initialize the context
 
-    llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+    llama_context_params ctx_params = common_context_params_to_llama(params);
 
     ctx_params.n_ctx   = n_kv_req;
     ctx_params.n_batch = std::max(n_predict, n_parallel);
 
-    llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
@@ -86,20 +86,40 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
 
     for (auto id : tokens_list) {
-        fprintf(stderr, "%s", llama_token_to_piece(ctx, id).c_str());
+        fprintf(stderr, "%s", common_token_to_piece(ctx, id).c_str());
     }
 
     fflush(stderr);
 
     // create a llama_batch
     // we use this object to submit token data for decoding
-    llama_batch batch = llama_batch_init(std::max(tokens_list.size(), (size_t)n_parallel), 0, 1);
+    llama_batch batch = llama_batch_init(std::max(tokens_list.size(), (size_t) n_parallel), 0, n_parallel);
+
+    std::vector<llama_seq_id> seq_ids(n_parallel, 0);
+    for (int32_t i = 0; i < n_parallel; ++i) {
+        seq_ids[i] = i;
+    }
 
     // evaluate the initial prompt
     for (size_t i = 0; i < tokens_list.size(); ++i) {
-        llama_batch_add(batch, tokens_list[i], i, { 0 }, false);
+        common_batch_add(batch, tokens_list[i], i, seq_ids, false);
     }
     GGML_ASSERT(batch.n_tokens == (int) tokens_list.size());
+
+    if (llama_model_has_encoder(model)) {
+        if (llama_encode(ctx, batch)) {
+            LOG_TEE("%s : failed to eval\n", __func__);
+            return 1;
+        }
+
+        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+            decoder_start_token_id = llama_token_bos(model);
+        }
+
+        common_batch_clear(batch);
+        common_batch_add(batch, decoder_start_token_id, 0, seq_ids, false);
+    }
 
     // llama_decode will output logits only for the last token of the prompt
     batch.logits[batch.n_tokens - 1] = true;
@@ -109,11 +129,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // assign the system KV cache to all parallel sequences
-    // this way, the parallel sequences will "reuse" the prompt tokens without having to copy them
-    for (int32_t i = 1; i < n_parallel; ++i) {
-        llama_kv_cache_seq_cp(ctx, 0, i, -1, -1);
-    }
+    //// assign the system KV cache to all parallel sequences
+    //// this way, the parallel sequences will "reuse" the prompt tokens without having to copy them
+    //for (int32_t i = 1; i < n_parallel; ++i) {
+    //    llama_kv_cache_seq_cp(ctx, 0, i, -1, -1);
+    //}
 
     if (n_parallel > 1) {
         LOG_TEE("\n\n%s: generating %d sequences ...\n", __func__, n_parallel);
@@ -135,7 +155,7 @@ int main(int argc, char ** argv) {
 
     while (n_cur <= n_predict) {
         // prepare the next batch
-        llama_batch_clear(batch);
+        common_batch_clear(batch);
 
         // sample the next token for each parallel sequence / stream
         for (int32_t i = 0; i < n_parallel; ++i) {
@@ -181,16 +201,16 @@ int main(int argc, char ** argv) {
 
             // if there is only one stream, we print immediately to stdout
             if (n_parallel == 1) {
-                LOG_TEE("%s", llama_token_to_piece(ctx, new_token_id).c_str());
+                LOG_TEE("%s", common_token_to_piece(ctx, new_token_id).c_str());
                 fflush(stdout);
             }
 
-            streams[i] += llama_token_to_piece(ctx, new_token_id);
+            streams[i] += common_token_to_piece(ctx, new_token_id);
 
             i_batch[i] = batch.n_tokens;
 
             // push this new token for next evaluation
-            llama_batch_add(batch, new_token_id, n_cur, { i }, true);
+            common_batch_add(batch, new_token_id, n_cur, { i }, true);
 
             n_decode += 1;
         }

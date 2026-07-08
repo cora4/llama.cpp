@@ -1,14 +1,27 @@
+//
+// Copyright (C) 2023-2025 The llama.cpp authors
+// Copyright (C) 2024-2025 Iwan Kawrakow
+// MIT license
+// SPDX-License-Identifier: MIT
+//
+
+#if defined(_MSC_VER)
+#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+#endif
+
 #include "common.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
-#include "json.hpp"
-#include "json-schema-to-grammar.h"
+#include "llama-vocab.h"
 #include "llama.h"
-
+#include "chat.h"
+#include "json-schema-to-grammar.h"
 #include <algorithm>
 #include <cinttypes>
+#include <climits>
 #include <cmath>
 #include <codecvt>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -70,8 +83,289 @@
 #endif
 #define LLAMA_CURL_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
 #endif // LLAMA_USE_CURL
-
+#ifdef GGML_USE_RPC
+#  include "ggml-rpc.h"
+#endif
 using json = nlohmann::ordered_json;
+
+common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
+
+common_time_meas::~common_time_meas() {
+    if (t_start_us >= 0) {
+        t_acc += ggml_time_us() - t_start_us;
+    }
+}
+
+bool common_speculative_type_is_self_spec(enum common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+        case COMMON_SPECULATIVE_TYPE_SUFFIX:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int32_t common_speculative_stage_effective_n_max(
+        const common_params_speculative & params,
+        const common_speculative_stage_params & stage) {
+    return stage.has_n_max_override() ? stage.n_max : params.n_max;
+}
+
+static int32_t common_speculative_stage_effective_n_min(
+        const common_params_speculative & params,
+        const common_speculative_stage_params & stage) {
+    return stage.has_n_min_override() ? stage.n_min : params.n_min;
+}
+
+std::vector<common_speculative_stage_params> common_params_speculative::get_resolved_stages() const {
+    if (!stages.empty()) {
+        std::vector<common_speculative_stage_params> resolved;
+        resolved.reserve(stages.size());
+
+        for (const auto & stage : stages) {
+            if (stage.type != COMMON_SPECULATIVE_TYPE_NONE) {
+                resolved.push_back(stage);
+            }
+        }
+
+        return resolved;
+    }
+
+    if (type == COMMON_SPECULATIVE_TYPE_NONE) {
+        return {};
+    }
+
+    return {{ .type = type }};
+}
+
+common_params_speculative common_params_speculative::with_stage_overrides(const common_speculative_stage_params & stage) const {
+    common_params_speculative result = *this;
+
+    result.type = stage.type;
+
+    if (stage.has_n_max_override()) {
+        result.n_max = stage.n_max;
+    }
+    if (stage.has_n_min_override()) {
+        result.n_min = stage.n_min;
+    }
+    if (stage.has_p_min_override()) {
+        result.p_min = stage.p_min;
+    }
+    if (stage.has_dflash_cross_ctx_override()) {
+        result.dflash_cross_ctx = stage.dflash_cross_ctx;
+    }
+    if (stage.has_ngram_size_n_override()) {
+        result.ngram_size_n = stage.ngram_size_n;
+        result.ngram_mod.reset();
+    }
+    if (stage.has_ngram_size_m_override()) {
+        result.ngram_size_m = stage.ngram_size_m;
+    }
+    if (stage.has_ngram_min_hits_override()) {
+        result.ngram_min_hits = stage.ngram_min_hits;
+    }
+    if (stage.has_suffix_min_match_len_override()) {
+        result.suffix_min_match_len = stage.suffix_min_match_len;
+    }
+    if (stage.has_suffix_max_depth_override()) {
+        result.suffix_max_depth = stage.suffix_max_depth;
+    }
+    if (stage.has_suffix_corpus_override()) {
+        result.suffix_corpus = stage.suffix_corpus;
+    }
+
+    result.n_max = std::max(result.n_max, 0);
+    result.n_min = std::max(0, std::min(result.n_min, result.n_max));
+    result.stages.clear();
+
+    return result;
+}
+
+bool common_params_speculative::has_stage_chain() const {
+    return !get_resolved_stages().empty();
+}
+
+bool common_params_speculative::has_stage_type(common_speculative_type stage_type) const {
+    const auto resolved = get_resolved_stages();
+    return std::any_of(resolved.begin(), resolved.end(), [stage_type](const common_speculative_stage_params & stage) {
+        return stage.type == stage_type;
+    });
+}
+
+void common_params_speculative::remove_stage_type(common_speculative_type stage_type) {
+    stages.erase(std::remove_if(stages.begin(), stages.end(), [stage_type](const common_speculative_stage_params & stage) {
+        return stage.type == stage_type;
+    }), stages.end());
+
+    if (type == stage_type) {
+        const auto resolved = get_resolved_stages();
+        type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+    }
+}
+
+bool common_params_speculative::has_composite_stage_chain() const {
+    return get_resolved_stages().size() > 1;
+}
+
+bool common_params_speculative::needs_dft_model() const {
+    return has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) ||
+        has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        (has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) && has_dft());
+}
+
+void common_params_speculative::clear_dft() {
+    if (model_dft != nullptr) {
+        llama_free_model(model_dft);
+        model_dft = nullptr;
+    }
+
+    model.clear();
+    params.clear();
+    mparams_dft.path.clear();
+    cparams_dft = llama_context_default_params();
+}
+
+int32_t common_params_speculative::get_max_stage_n_max() const {
+    const auto resolved = get_resolved_stages();
+    if (resolved.empty()) {
+        return std::max(n_max, 0);
+    }
+
+    int32_t max_n_max = 0;
+    for (const auto & stage : resolved) {
+        max_n_max = std::max(max_n_max, common_speculative_stage_effective_n_max(*this, stage));
+    }
+
+    return std::max(max_n_max, 0);
+}
+
+int32_t common_params_speculative::get_min_usable_stage_n_min() const {
+    const auto resolved = get_resolved_stages();
+    if (resolved.empty()) {
+        return std::max(0, std::min(n_min, n_max));
+    }
+
+    int32_t min_n_min = INT_MAX;
+    for (const auto & stage : resolved) {
+        min_n_min = std::min(min_n_min, std::max(0, std::min(common_speculative_stage_effective_n_min(*this, stage), common_speculative_stage_effective_n_max(*this, stage))));
+    }
+
+    return min_n_min == INT_MAX ? 0 : min_n_min;
+}
+
+bool common_speculative_validate_chain(const common_params_speculative & params, std::string * error) {
+    const auto fail = [error](const std::string & msg) {
+        if (error != nullptr) {
+            *error = msg;
+        }
+        return false;
+    };
+
+    const auto resolved = params.get_resolved_stages();
+    if (resolved.empty()) {
+        return true;
+    }
+
+    if (resolved.size() > 2) {
+        return fail("at most two speculative stages are supported in this PR");
+    }
+
+    std::unordered_set<int> seen_types;
+    for (const auto & stage : resolved) {
+        if (stage.type == COMMON_SPECULATIVE_TYPE_NONE && resolved.size() > 1) {
+            return fail("the 'none' speculative stage cannot be combined with other stages");
+        }
+
+        if (!seen_types.insert((int) stage.type).second) {
+            return fail("duplicate speculative stage type in chain: " + common_speculative_type_to_str(stage.type));
+        }
+
+        const auto stage_params = params.with_stage_overrides(stage);
+        if (stage_params.n_min > stage_params.n_max) {
+            return fail("speculative stage has n_min greater than n_max");
+        }
+
+        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || stage.type == COMMON_SPECULATIVE_TYPE_DFLASH) && !params.has_dft()) {
+            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
+        }
+
+        if (stage.type == COMMON_SPECULATIVE_TYPE_DFLASH && stage_params.dflash_cross_ctx < 1) {
+            return fail("dflash speculative stage requires cross_ctx >= 1");
+        }
+    }
+
+    if (resolved.size() == 2) {
+        const auto first = resolved[0].type;
+        const auto second = resolved[1].type;
+
+        if (!common_speculative_type_is_self_spec(first)) {
+            return fail("two-stage speculative mode currently requires a self-spec stage first");
+        }
+
+        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT) {
+            return fail("two-stage speculative mode currently supports only MTP or draft-model fallback after self-spec");
+        }
+    }
+
+    return true;
+}
+
+std::string common_speculative_stage_chain_to_str(const common_params_speculative & params) {
+    const auto resolved = params.get_resolved_stages();
+    if (resolved.empty()) {
+        return "none";
+    }
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < resolved.size(); ++i) {
+        if (i > 0) {
+            oss << " -> ";
+        }
+        oss << common_speculative_type_to_str(resolved[i].type);
+    }
+
+    return oss.str();
+}
+//
+// Environment variable utils
+//
+
+template<typename T>
+static typename std::enable_if<std::is_same<T, std::string>::value, void>::type
+get_env(std::string name, T & target) {
+    char * value = std::getenv(name.c_str());
+    target = value ? std::string(value) : target;
+}
+
+template<typename T>
+static typename std::enable_if<!std::is_same<T, bool>::value && std::is_integral<T>::value, void>::type
+get_env(std::string name, T & target) {
+    char * value = std::getenv(name.c_str());
+    target = value ? std::stoi(value) : target;
+}
+
+template<typename T>
+static typename std::enable_if<std::is_floating_point<T>::value, void>::type
+get_env(std::string name, T & target) {
+    char * value = std::getenv(name.c_str());
+    target = value ? std::stof(value) : target;
+}
+
+template<typename T>
+static typename std::enable_if<std::is_same<T, bool>::value, void>::type
+get_env(std::string name, T & target) {
+    char * value = std::getenv(name.c_str());
+    if (value) {
+        std::string val(value);
+        target = val == "1" || val == "true";
+    }
+}
 
 //
 // CPU utils
@@ -187,8 +481,158 @@ int32_t cpu_get_num_math() {
 }
 
 //
+// Arg utils
+//
+common_webui common_webui_from_name(const std::string& format) {
+    if (format == "none") {
+        return COMMON_WEBUI_NONE;
+    }
+    else if (format == "auto") {
+        return COMMON_WEBUI_AUTO;
+    }
+    else if (format == "llamacpp") {
+        return COMMON_WEBUI_LLAMACPP;
+    }
+    else {
+        return COMMON_WEBUI_AUTO;
+    }
+}
+
+common_checkpoint_eviction common_checkpoint_eviction_from_name(const std::string & format) {
+    if (format == "auto") {
+        return COMMON_CHECKPOINT_EVICTION_AUTO;
+    } else if (format == "fifo") {
+        return COMMON_CHECKPOINT_EVICTION_FIFO;
+    } else if (format == "variance") {
+        return COMMON_CHECKPOINT_EVICTION_VARIANCE;
+    } else {
+        return COMMON_CHECKPOINT_EVICTION_AUTO;
+    }
+}
+
+thinking_tokens thinking_tokens_from_string(const std::string& format) {
+    thinking_tokens think_token;
+    std::string token_string = string_strip(format);
+    if (token_string == "none" || token_string == "None") {
+        think_token.exclude = false;
+        return think_token;
+    }
+    else if (token_string == "auto" || token_string == "Auto") {
+        think_token.exclude = true;
+        think_token.begin = "<think>";
+        think_token.end = "</think>";
+        return think_token;
+    }
+    // Use user provided think tokens
+    auto start_end = string_split(format, ",");
+    if (start_end.size() == 2) {
+        think_token.exclude = true;
+        think_token.begin = start_end[0];
+        think_token.end = start_end[1];
+    }
+    return think_token;
+}
+
+
+static std::string read_file(const std::string& fname) {
+    std::ifstream file(fname);
+    if (!file) {
+        throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname.c_str()));
+    }
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    return content;
+}
+
+static std::string parse_device_list(const std::string& value) {
+    if (value==" " || value.find("-")!= std::string::npos) {
+        throw std::invalid_argument("no devices specified");
+    }
+    return value;
+}
+
+static std::string add_rpc_devices(std::string& servers) {
+    std::string rpc_devices;
+#ifdef GGML_USE_RPC
+    std::vector<std::string> rpc_servers = string_split(servers, ",");
+    if (rpc_servers.empty()) {
+        throw std::invalid_argument("no RPC servers specified");
+    }
+    for (auto& server : rpc_servers) {
+        uint32_t dev_count = ggml_backend_rpc_get_device_count(server.c_str());
+        uint32_t device = 0;
+        for (uint32_t i = 0; i < dev_count; ++i) {
+            const auto buft = ggml_backend_rpc_buffer_type(server.c_str(), device);
+            if (buft != nullptr) {
+                rpc_devices = rpc_devices + server + "|" + std::to_string(device) + ",";
+                ++device;
+            }
+        }
+    }
+    if (!rpc_devices.empty()) {
+        rpc_devices = rpc_devices.substr(0, rpc_devices.size() - 1); // remove trailing comma
+    }
+#endif
+    return rpc_devices;
+}
+
+std::pair<long, std::vector<char>> common_remote_get_content(const std::string& url, const common_remote_params&) {
+    if (!url.empty()) {
+        throw std::runtime_error("error: built without CURL, cannot download file from the internet");
+    }
+    return {};
+}
+
+//
 // CLI argument parsing
 //
+
+std::pair<int, char**> parse_command_line(const std::string& commandLine) {
+    std::vector<std::string> tokens;
+    std::string current;
+    bool inQuotes = false;
+
+    for (size_t i = 0; i < commandLine.length(); i++) {
+        char c = commandLine[i];
+
+        if (c == '\"') {
+            inQuotes = !inQuotes;
+        }
+        else if (c == ' ' && !inQuotes) {
+            if (!current.empty()) {
+                tokens.push_back(current);
+                current.clear();
+            }
+        }
+        else {
+            current += c;
+        }
+    }
+
+    if (!current.empty()) {
+        tokens.push_back(current);
+    }
+
+    int argc = static_cast<int>(tokens.size());
+    char** argv = new char* [static_cast<size_t>(argc) + 1];
+
+    for (int i = 0; i < argc; i++) {
+        argv[i] = new char[tokens[i].length() + 1];
+        std::strcpy(argv[i], tokens[i].c_str());
+    }
+    argv[argc] = nullptr;
+    return { argc, argv };
+}
+
+void free_command_line(int argc, char** argv) {
+    if (argv == nullptr) return;
+
+    for (int i = 0; i < argc; i++) {
+        delete[] argv[i];
+    }
+    delete[] argv;
+}
+
 
 void gpt_params_handle_model_default(gpt_params & params) {
     if (!params.hf_repo.empty()) {
@@ -199,24 +643,60 @@ void gpt_params_handle_model_default(gpt_params & params) {
             }
             params.hf_file = params.model;
         } else if (params.model.empty()) {
-            params.model = fs_get_cache_file(string_split(params.hf_file, '/').back());
+            params.model = fs_get_cache_file(string_split(params.hf_file, "/").back());
         }
     } else if (!params.model_url.empty()) {
         if (params.model.empty()) {
-            auto f = string_split(params.model_url, '#').front();
-            f = string_split(f, '?').front();
-            params.model = fs_get_cache_file(string_split(f, '/').back());
+            auto f = string_split(params.model_url, "#").front();
+            f = string_split(f, "?").front();
+            params.model = fs_get_cache_file(string_split(f, "/").back());
         }
     } else if (params.model.empty()) {
         params.model = DEFAULT_MODEL_PATH;
     }
 }
 
+static bool is_truthy(const std::string & value) {
+    return value == "on" || value == "enabled" || value == "true" || value == "1";
+}
+
+static bool is_falsey(const std::string & value) {
+    return value == "off" || value == "disabled" || value == "false" || value == "0";
+}
+
+static bool is_autoy(const std::string & value) {
+    return value == "auto" || value == "-1";
+}
+
+static void common_speculative_finalize_stages(gpt_params & params) {
+    auto & spec = params.speculative;
+
+    if (!spec.stages.empty()) {
+        const auto resolved = spec.get_resolved_stages();
+        if (resolved.size() != spec.stages.size()) {
+            spec.stages = resolved;
+        }
+
+        spec.type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+        params.has_mtp = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+        return;
+    }
+
+    if (spec.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        spec.stages.push_back({ .type = spec.type });
+    } else if (params.has_mtp) {
+        spec.stages.push_back({ .type = COMMON_SPECULATIVE_TYPE_MTP });
+    }
+
+    spec.type = spec.stages.empty() ? COMMON_SPECULATIVE_TYPE_NONE : spec.stages.front().type;
+    params.has_mtp = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+}
+
 bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     bool invalid_param = false;
     std::string arg;
     const std::string arg_prefix = "--";
-    llama_sampling_params & sparams = params.sparams;
+    common_params_sampling & sparams = params.sparams;
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -237,8 +717,14 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
 
     gpt_params_handle_model_default(params);
 
+    if (params.hf_token.empty()) {
+        get_env("HF_TOKEN", params.hf_token);
+    }
+
     if (params.escape) {
-        string_process_escapes(params.prompt);
+        if (!params.prompt_is_binary) {
+            string_process_escapes(params.prompt);
+        }
         string_process_escapes(params.input_prefix);
         string_process_escapes(params.input_suffix);
         string_process_escapes(sparams.cfg_negative_prompt);
@@ -247,15 +733,75 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         }
     }
 
+    for (auto & rep : params.speculative.replacements) {
+        string_process_escapes(rep.first);
+        string_process_escapes(rep.second);
+    }
+
     if (!params.kv_overrides.empty()) {
         params.kv_overrides.emplace_back();
         params.kv_overrides.back().key[0] = 0;
+    }
+    if (!params.tensor_buft_overrides.empty()) {
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
+    if (!params.fit_margin_array.empty()) {
+        params.fit_margin_array.push_back(-1);
+        params.fit_margin_array.push_back(0);
+    }
+
+    if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
+        throw std::runtime_error(string_format(
+            "error: the supplied chat template is not supported: %s%s\n",
+            params.chat_template.c_str(),
+            params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, we only support commonly used templates"
+        ));
+    }
+
+    common_speculative_finalize_stages(params);
+
+    std::string spec_error;
+    if (!common_speculative_validate_chain(params.speculative, &spec_error)) {
+        throw std::invalid_argument("error: invalid speculative stage configuration: " + spec_error);
     }
 
     return true;
 }
 
+void gpt_params_parse_from_env(gpt_params & params) {
+    // we only care about server-related params for now
+    get_env("LLAMA_ARG_MODEL",            params.model);
+    get_env("LLAMA_ARG_MODEL_URL",        params.model_url);
+    get_env("LLAMA_ARG_MODEL_ALIAS",      params.model_alias);
+    get_env("LLAMA_ARG_HF_REPO",          params.hf_repo);
+    get_env("LLAMA_ARG_HF_FILE",          params.hf_file);
+    get_env("LLAMA_ARG_THREADS",          params.n_threads);
+    get_env("LLAMA_ARG_CTX_SIZE",         params.n_ctx);
+    get_env("LLAMA_ARG_N_PARALLEL",       params.n_parallel);
+    get_env("LLAMA_ARG_BATCH",            params.n_batch);
+    get_env("LLAMA_ARG_UBATCH",           params.n_ubatch);
+    get_env("LLAMA_ARG_N_GPU_LAYERS",     params.n_gpu_layers);
+    get_env("LLAMA_ARG_THREADS_HTTP",     params.n_threads_http);
+    get_env("LLAMA_ARG_CHAT_TEMPLATE",    params.chat_template);
+    get_env("LLAMA_ARG_N_PREDICT",        params.n_predict);
+    get_env("LLAMA_ARG_ENDPOINT_METRICS", params.endpoint_metrics);
+    get_env("LLAMA_ARG_ENDPOINT_SLOTS",   params.endpoint_slots);
+    get_env("LLAMA_ARG_EMBEDDINGS",       params.embedding);
+    get_env("LLAMA_ARG_FLASH_ATTN",       params.flash_attn);
+    get_env("LLAMA_ARG_DEFRAG_THOLD",     params.defrag_thold);
+    get_env("LLAMA_ARG_CONT_BATCHING",    params.cont_batching);
+    get_env("LLAMA_ARG_HOST",             params.hostname);
+    get_env("LLAMA_ARG_PORT",             params.port);
+    get_env("LLAMA_ARG_CACHE_TYPE_K",     params.cache_type_k);
+    get_env("LLAMA_ARG_CACHE_TYPE_V",     params.cache_type_v);
+    get_env("LLAMA_ARG_MLOCK",            params.use_mlock);
+    get_env("LLAMA_ARG_K_CACHE_HADAMARD", params.k_cache_hadamard);
+    get_env("LLAMA_ARG_V_CACHE_HADAMARD", params.v_cache_hadamard);
+
+}
+
 bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
+    gpt_params_parse_from_env(params);
     const auto params_org = params; // the example can modify the default params
 
     try {
@@ -273,26 +819,292 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     return true;
 }
 
+namespace {
+bool parse_buft_overrides(const std::string& value, std::vector<llama_model_tensor_buft_override>& overrides) {
+    /* static */ std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+    if (buft_list.empty()) {
+        // enumerate all the devices and add their buffer types to the list
+        for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
+            //auto * dev = ggml_backend_reg_get_name(i);
+            auto * buft = ggml_backend_reg_get_default_buffer_type(i);
+            if (buft) {
+                buft_list[ggml_backend_buft_name(buft)] = buft;
+            }
+        }
+    }
+    for (const auto & override : string_split<std::string>(value, ',')) {
+        std::string::size_type pos = override.find('=');
+        if (pos == std::string::npos) {
+            fprintf(stderr, "Invalid buft override argument %s\n", value.c_str());
+            return false;
+        }
+        std::string tensor_name = override.substr(0, pos);
+        std::string buffer_type = override.substr(pos + 1);
+        if (buft_list.find(buffer_type) == buft_list.end()) {
+            fprintf(stderr, "Available buffer types:\n");
+            for (const auto & it : buft_list) {
+                fprintf(stderr, "  %s\n", ggml_backend_buft_name(it.second));
+            }
+            return false;
+        }
+        overrides.push_back({strdup(tensor_name.c_str()), buft_list.at(buffer_type)});
+    }
+    return true;
+}
+template<class T1, class T2>
+std::vector<std::pair<T1,T2>> string_split_pairs(const std::string & str, char delim) {
+    std::vector<std::pair<T1,T2>> values;
+    std::istringstream str_stream(str);
+    std::string token;
+    T1 first_value;
+    int i = 0;
+    while (std::getline(str_stream, token, delim)) {
+        std::istringstream token_stream(token);
+        if (i%2 == 0) {
+            token_stream >> first_value;
+        } else {
+            T2 value;
+            token_stream >> value;
+            values.emplace_back(first_value, value);
+        }
+        i++;
+    }
+    return values;
+}
+
+static std::string common_normalize_spec_stage_key(std::string key) {
+    while (!key.empty() && key.front() == '-') {
+        key.erase(key.begin());
+    }
+
+    std::replace(key.begin(), key.end(), '-', '_');
+
+    return key;
+}
+
+static std::invalid_argument common_speculative_legacy_option_error(
+        const std::string & arg,
+        const std::string & replacement) {
+    return std::invalid_argument(
+        "legacy speculative option '" + arg + "' is disabled; use " + replacement);
+}
+
+static void common_speculative_remove_explicit_stage(common_params_speculative & params, common_speculative_type type) {
+    params.stages.erase(std::remove_if(params.stages.begin(), params.stages.end(), [type](const common_speculative_stage_params & stage) {
+        return stage.type == type;
+    }), params.stages.end());
+
+    if (params.stages.empty() && params.type == type) {
+        params.type = COMMON_SPECULATIVE_TYPE_NONE;
+    }
+}
+
+static void common_speculative_stage_apply_kv(
+        common_speculative_stage_params & stage,
+        const std::string & key_raw,
+        const std::string & value_raw) {
+    const std::string key = common_normalize_spec_stage_key(key_raw);
+
+    if (key == "n_max") {
+        stage.n_max = std::stoi(value_raw);
+        if (stage.n_max < 0) {
+            throw std::invalid_argument("speculative stage n_max must be >= 0");
+        }
+        return;
+    }
+    if (key == "n_min") {
+        stage.n_min = std::stoi(value_raw);
+        if (stage.n_min < 0) {
+            throw std::invalid_argument("speculative stage n_min must be >= 0");
+        }
+        return;
+    }
+    if (key == "p_min") {
+        stage.p_min = std::stof(value_raw);
+        if (stage.p_min < 0.0f) {
+            throw std::invalid_argument("speculative stage p_min must be >= 0");
+        }
+        return;
+    }
+    if (key == "cross_ctx" || key == "dflash_cross_ctx") {
+        stage.dflash_cross_ctx = std::stoi(value_raw);
+        if (stage.dflash_cross_ctx < 1) {
+            throw std::invalid_argument("speculative stage dflash cross_ctx must be at least 1");
+        }
+        return;
+    }
+    if (key == "ngram_size_n") {
+        stage.ngram_size_n = std::stoi(value_raw);
+        if (stage.ngram_size_n < 1 || stage.ngram_size_n > 1024) {
+            throw std::invalid_argument("speculative stage ngram_size_n must be between 1 and 1024 inclusive");
+        }
+        return;
+    }
+    if (key == "ngram_size_m") {
+        stage.ngram_size_m = std::stoi(value_raw);
+        if (stage.ngram_size_m < 1 || stage.ngram_size_m > 1024) {
+            throw std::invalid_argument("speculative stage ngram_size_m must be between 1 and 1024 inclusive");
+        }
+        return;
+    }
+    if (key == "ngram_min_hits") {
+        stage.ngram_min_hits = std::stoi(value_raw);
+        if (stage.ngram_min_hits < 1) {
+            throw std::invalid_argument("speculative stage ngram_min_hits must be at least 1");
+        }
+        return;
+    }
+    if (key == "suffix_min_match_len") {
+        stage.suffix_min_match_len = std::stoi(value_raw);
+        if (stage.suffix_min_match_len < 1) {
+            throw std::invalid_argument("speculative stage suffix_min_match_len must be at least 1");
+        }
+        return;
+    }
+    if (key == "suffix_max_depth") {
+        stage.suffix_max_depth = std::stoi(value_raw);
+        if (stage.suffix_max_depth < 1) {
+            throw std::invalid_argument("speculative stage suffix_max_depth must be at least 1");
+        }
+        return;
+    }
+    if (key == "suffix_corpus") {
+        stage.suffix_corpus = value_raw;
+        if (stage.suffix_corpus.empty()) {
+            throw std::invalid_argument("speculative stage suffix_corpus must not be empty");
+        }
+        return;
+    }
+
+    throw std::invalid_argument("unknown speculative stage parameter: " + key_raw);
+}
+
+static std::vector<std::string> common_speculative_stage_split_kvs(const std::string & values) {
+    std::vector<std::string> result;
+    std::string current;
+    char quote = '\0';
+    bool escaped = false;
+
+    for (char ch : values) {
+        if (escaped) {
+            current += ch;
+            escaped = false;
+            continue;
+        }
+
+        if (ch == '\\') {
+            current += ch;
+            escaped = true;
+            continue;
+        }
+
+        if (quote != '\0') {
+            if (ch == quote) {
+                quote = '\0';
+            }
+            current += ch;
+            continue;
+        }
+
+        if ((ch == '\'' || ch == '"') && !current.empty() && current.back() == '=') {
+            quote = ch;
+            current += ch;
+            continue;
+        }
+
+        if (ch == ',') {
+            result.push_back(current);
+            current.clear();
+            continue;
+        }
+
+        current += ch;
+    }
+
+    if (quote != '\0') {
+        throw std::invalid_argument("invalid speculative stage option list: unterminated quote");
+    }
+
+    result.push_back(current);
+    return result;
+}
+
+static std::string common_speculative_stage_unescape_value(const std::string & value_raw) {
+    std::string value = value_raw;
+    if (value.size() >= 2) {
+        const char first = value.front();
+        const char last = value.back();
+        if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
+            value = value.substr(1, value.size() - 2);
+        }
+    }
+
+    std::string result;
+    result.reserve(value.size());
+
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char ch = value[i];
+        if (ch != '\\' || i + 1 >= value.size()) {
+            result += ch;
+            continue;
+        }
+
+        const char next = value[i + 1];
+        if (next == '\\' || next == ',' || next == '\'' || next == '"') {
+            result += next;
+            ++i;
+            continue;
+        }
+
+        result += ch;
+    }
+
+    return result;
+}
+
+static common_speculative_stage_params common_speculative_stage_from_arg(const std::string & value) {
+    const auto spec_pos = value.find(':');
+    const std::string type_name = value.substr(0, spec_pos);
+
+    common_speculative_stage_params stage;
+    stage.type = common_speculative_type_from_name(type_name);
+    if (stage.type == COMMON_SPECULATIVE_TYPE_COUNT) {
+        throw std::invalid_argument("unknown speculative stage type: " + type_name);
+    }
+
+    if (spec_pos == std::string::npos) {
+        return stage;
+    }
+
+    for (const std::string & kv : common_speculative_stage_split_kvs(value.substr(spec_pos + 1))) {
+        const auto eq_pos = kv.find('=');
+        if (eq_pos == std::string::npos) {
+            throw std::invalid_argument("invalid speculative stage option: " + kv);
+        }
+
+        common_speculative_stage_apply_kv(stage, kv.substr(0, eq_pos), common_speculative_stage_unescape_value(kv.substr(eq_pos + 1)));
+    }
+
+    return stage;
+}
+}
+
+#define CHECK_ARG if (++i >= argc) { invalid_param = true; return true; }
+
 bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_params & params, int & i, bool & invalid_param) {
     const char split_delim = ',';
 
-    llama_sampling_params & sparams = params.sparams;
+    common_params_sampling & sparams = params.sparams;
 
     if (arg == "-s" || arg == "--seed") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         // TODO: this is temporary, in the future the sampling state will be moved fully to llama_sampling_context.
         params.seed = std::stoul(argv[i]);
         sparams.seed = std::stoul(argv[i]);
         return true;
     }
     if (arg == "-t" || arg == "--threads") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_threads = std::stoi(argv[i]);
         if (params.n_threads <= 0) {
             params.n_threads = std::thread::hardware_concurrency();
@@ -300,44 +1112,41 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-tb" || arg == "--threads-batch") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_threads_batch = std::stoi(argv[i]);
         if (params.n_threads_batch <= 0) {
             params.n_threads_batch = std::thread::hardware_concurrency();
         }
         return true;
     }
-    if (arg == "-td" || arg == "--threads-draft") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
+    if (arg == "-tm" || arg == "--threads-mtmd") {
+        CHECK_ARG
+        params.n_threads_mtmd = std::stoi(argv[i]);
+        if (params.n_threads_mtmd <= 0) {
+            params.n_threads_mtmd = std::thread::hardware_concurrency();
         }
-        params.n_threads_draft = std::stoi(argv[i]);
-        if (params.n_threads_draft <= 0) {
-            params.n_threads_draft = std::thread::hardware_concurrency();
+        return true;
+    }
+    if (arg == "-td" || arg == "--threads-draft") {
+        CHECK_ARG
+        params.speculative.n_threads = std::stoi(argv[i]);
+        if (params.speculative.n_threads <= 0) {
+            params.speculative.n_threads = std::thread::hardware_concurrency();
         }
         return true;
     }
     if (arg == "-tbd" || arg == "--threads-batch-draft") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.n_threads_batch_draft = std::stoi(argv[i]);
-        if (params.n_threads_batch_draft <= 0) {
-            params.n_threads_batch_draft = std::thread::hardware_concurrency();
+        CHECK_ARG
+        params.speculative.n_threads_batch = std::stoi(argv[i]);
+        if (params.speculative.n_threads_batch <= 0) {
+            params.speculative.n_threads_batch = std::thread::hardware_concurrency();
         }
         return true;
     }
     if (arg == "-p" || arg == "--prompt") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.prompt = argv[i];
+        params.prompt_is_binary = false;
         return true;
     }
     if (arg == "-e" || arg == "--escape") {
@@ -349,10 +1158,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--prompt-cache") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.path_prompt_cache = argv[i];
         return true;
     }
@@ -365,10 +1171,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-bf" || arg == "--binary-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i], std::ios::binary);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -381,13 +1184,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         ss << file.rdbuf();
         params.prompt = ss.str();
         fprintf(stderr, "Read %zu bytes from binary file %s\n", params.prompt.size(), argv[i]);
+        params.prompt_is_binary = true;
         return true;
     }
     if (arg == "-f" || arg == "--file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i]);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -400,13 +1201,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         if (!params.prompt.empty() && params.prompt.back() == '\n') {
             params.prompt.pop_back();
         }
+        params.prompt_is_binary = false;
         return true;
     }
     if (arg == "--in-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i]);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -417,66 +1216,47 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-n" || arg == "--predict" || arg == "--n-predict") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_predict = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--top-k") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.top_k = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-c" || arg == "--ctx-size") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_ctx = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "-cd" || arg == "--ctx-size-draft") {
+        CHECK_ARG
+        params.speculative.n_ctx = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--grp-attn-n" || arg == "-gan") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.grp_attn_n = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--grp-attn-w" || arg == "-gaw") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.grp_attn_w = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--rope-freq-base") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.rope_freq_base = std::stof(argv[i]);
         return true;
     }
     if (arg == "--rope-freq-scale") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.rope_freq_scale = std::stof(argv[i]);
         return true;
     }
     if (arg == "--rope-scaling") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::string value(argv[i]);
         /**/ if (value == "none") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE; }
         else if (value == "linear") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR; }
@@ -485,58 +1265,37 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--rope-scale") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.rope_freq_scale = 1.0f / std::stof(argv[i]);
         return true;
     }
     if (arg == "--yarn-orig-ctx") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.yarn_orig_ctx = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--yarn-ext-factor") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.yarn_ext_factor = std::stof(argv[i]);
         return true;
     }
     if (arg == "--yarn-attn-factor") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.yarn_attn_factor = std::stof(argv[i]);
         return true;
     }
     if (arg == "--yarn-beta-fast") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.yarn_beta_fast = std::stof(argv[i]);
         return true;
     }
     if (arg == "--yarn-beta-slow") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.yarn_beta_slow = std::stof(argv[i]);
         return true;
     }
     if (arg == "--pooling") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::string value(argv[i]);
         /**/ if (value == "none") { params.pooling_type = LLAMA_POOLING_TYPE_NONE; }
         else if (value == "mean") { params.pooling_type = LLAMA_POOLING_TYPE_MEAN; }
@@ -545,158 +1304,197 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else { invalid_param = true; }
         return true;
     }
+    if (arg == "--attention") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        /**/ if (value == "causal") { params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL; }
+        else if (value == "non-causal") { params.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL; }
+        else { invalid_param = true; }
+        return true;
+    }
     if (arg == "--defrag-thold" || arg == "-dt") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.defrag_thold = std::stof(argv[i]);
         return true;
     }
+    if (arg == "--max-extra-alloc" || arg == "-mea") {
+        CHECK_ARG
+        params.max_extra_alloc_MiB = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-nrep" || arg == "--n-repetitions") {
+        CHECK_ARG
+        params.nrep = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--samplers") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        const auto sampler_names = string_split(argv[i], ';');
+        CHECK_ARG
+        const auto sampler_names = string_split(argv[i], ";");
         sparams.samplers_sequence = llama_sampling_types_from_names(sampler_names, true);
         return true;
     }
     if (arg == "--sampling-seq") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.samplers_sequence = llama_sampling_types_from_chars(argv[i]);
         return true;
     }
     if (arg == "--top-p") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.top_p = std::stof(argv[i]);
         return true;
     }
     if (arg == "--min-p") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.min_p = std::stof(argv[i]);
         return true;
     }
     if (arg == "--temp") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.temp = std::stof(argv[i]);
         sparams.temp = std::max(sparams.temp, 0.0f);
         return true;
     }
     if (arg == "--tfs") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.tfs_z = std::stof(argv[i]);
         return true;
     }
     if (arg == "--typical") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.typical_p = std::stof(argv[i]);
         return true;
     }
     if (arg == "--repeat-last-n") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.penalty_last_n = std::stoi(argv[i]);
         sparams.n_prev = std::max(sparams.n_prev, sparams.penalty_last_n);
         return true;
     }
     if (arg == "--repeat-penalty") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.penalty_repeat = std::stof(argv[i]);
         return true;
     }
     if (arg == "--frequency-penalty") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.penalty_freq = std::stof(argv[i]);
         return true;
     }
     if (arg == "--presence-penalty") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.penalty_present = std::stof(argv[i]);
         return true;
     }
     if (arg == "--dynatemp-range") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.dynatemp_range = std::stof(argv[i]);
         return true;
     }
     if (arg == "--dynatemp-exp") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.dynatemp_exponent = std::stof(argv[i]);
         return true;
     }
     if (arg == "--mirostat") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.mirostat = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--mirostat-lr") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.mirostat_eta = std::stof(argv[i]);
         return true;
     }
     if (arg == "--mirostat-ent") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.mirostat_tau = std::stof(argv[i]);
         return true;
     }
-    if (arg == "--cfg-negative-prompt") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
+    if (arg == "--xtc-probability") {
+        CHECK_ARG
+        sparams.xtc_probability = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--xtc-threshold") {
+        CHECK_ARG
+        sparams.xtc_threshold = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--top-n-sigma") {
+        CHECK_ARG
+        sparams.top_n_sigma = std::stof(argv[i]);
+        return true;
+    }
+
+    if (arg == "--dry-multiplier") {
+        CHECK_ARG
+            sparams.dry_multiplier = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--dry-base") {
+        CHECK_ARG
+            sparams.dry_base = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--dry-allowed-length") {
+        CHECK_ARG
+            sparams.dry_allowed_length = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--dry-penalty-last-n") {
+        CHECK_ARG
+            sparams.dry_penalty_last_n = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--dry-sequence-breaker") {
+        CHECK_ARG
+        static bool defaults_cleared = false;
+
+        if (!defaults_cleared) {
+            params.sparams.dry_sequence_breakers.clear();
+            defaults_cleared = true;
         }
+       std::string value= std::string(argv[i]);
+        if (value == "none") {
+            params.sparams.dry_sequence_breakers.clear();
+        }
+        else {
+            for (size_t i = 0; i < value.size(); i++)
+            {
+                params.sparams.dry_sequence_breakers.emplace_back(std::string{}+value[i]);
+            }
+        }
+        return true;
+    }
+    if (arg == "--adaptive-target") {
+        CHECK_ARG
+        sparams.adaptive_target = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--adaptive-decay") {
+        CHECK_ARG
+        sparams.adaptive_decay = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--adaptive-updt-w-cur") {
+        sparams.adaptive_updt_w_cur = true;
+        return true;
+    }
+    if (arg == "--spec-replace") {
+        CHECK_ARG
+        std::string target = argv[i];
+        CHECK_ARG
+        std::string draft = argv[i];
+        params.speculative.replacements.emplace_back(std::move(target), std::move(draft));
+        return true;
+    }
+    if (arg == "--cfg-negative-prompt") {
+        CHECK_ARG
         sparams.cfg_negative_prompt = argv[i];
         return true;
     }
     if (arg == "--cfg-negative-prompt-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i]);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -710,204 +1508,235 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--cfg-scale") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         sparams.cfg_scale = std::stof(argv[i]);
         return true;
     }
     if (arg == "-b" || arg == "--batch-size") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_batch = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-ub" || arg == "--ubatch-size") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_ubatch = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--keep") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_keep = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--draft") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
+    if (arg == "--draft" || arg == "--draft-max" || arg == "--draft-n") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the value inside the relevant repeated --spec-type entry, e.g. --spec-type mtp:n_max=" + std::string(argv[i]) + ",p_min=0.0 or --spec-type draft:n_max=" + std::string(argv[i]) + ",p_min=0.0");
+    }
+    if (arg == "--draft-min" || arg == "--draft-n-min") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the value inside the relevant repeated --spec-type entry using the canonical key n_min, e.g. --spec-type ngram-mod:n_min=" + std::string(argv[i]));
+    }
+    if (arg == "--draft-p-min") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the value inside the relevant repeated --spec-type entry using the canonical key p_min, e.g. --spec-type mtp:p_min=" + std::string(argv[i]));
+    }
+    if (arg == "--recurrent-ckpt-mode") {
+        CHECK_ARG
+        const std::string val = argv[i];
+        if (val == "auto" || val == "AUTO") {
+            params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
+        } else if (val == "per-step" || val == "PER_STEP") {
+            params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_PER_STEP;
+        } else if (val == "gpu-fallback" || val == "GPU_FALLBACK") {
+            params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_GPU_FALLBACK;
+        } else if (val == "cpu" || val == "CPU") {
+            params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
+        } else {
+            throw std::invalid_argument("unknown --recurrent-ckpt-mode value: " + val +
+                "; expected auto, per-step, gpu-fallback, or cpu");
         }
-        params.n_draft = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--spec-autotune") {
+        params.speculative.autotune = true;
         return true;
     }
     if (arg == "--chunks") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_chunks = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-np" || arg == "--parallel") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_parallel = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-ns" || arg == "--sequences") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_sequences = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--p-split" || arg == "-ps") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.p_split = std::stof(argv[i]);
         return true;
     }
     if (arg == "-m" || arg == "--model") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.model = argv[i];
         return true;
     }
     if (arg == "-md" || arg == "--model-draft") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.model_draft = argv[i];
+        CHECK_ARG
+        params.speculative.model = argv[i];
         return true;
     }
+    if (arg == "--spec-stage") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "repeated --spec-type SPEC[:k=v,...] entries, e.g. --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0");
+    }
+    if (arg == "--spec-type") {
+        CHECK_ARG
+        params.speculative.stages.push_back(common_speculative_stage_from_arg(argv[i]));
+        const auto resolved = params.speculative.get_resolved_stages();
+        params.speculative.type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+        params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+        return true;
+    }
+    if (arg == "--spec-ngram-size-n") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type ngram-mod:ngram_size_n=" + std::string(argv[i]));
+    }
+    if (arg == "--spec-ngram-size-m") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type ngram-map-k4v:ngram_size_m=" + std::string(argv[i]));
+    }
+    if (arg == "--spec-ngram-min-hits") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type ngram-map-k4v:ngram_min_hits=" + std::string(argv[i]));
+    }
+    if (arg == "--suffix-pattern-len") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type suffix:suffix_min_match_len=" + std::string(argv[i]));
+    }
+    if (arg == "--suffix-max-depth") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type suffix:suffix_max_depth=" + std::string(argv[i]));
+    }
+    if (arg == "--suffix-corpus") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type suffix:suffix_corpus=" + std::string(argv[i]));
+    }
     if (arg == "-a" || arg == "--alias") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.model_alias = argv[i];
         return true;
     }
     if (arg == "-mu" || arg == "--model-url") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.model_url = argv[i];
         return true;
     }
-    if (arg == "-hfr" || arg == "--hf-repo") {
+    if (arg == "-hft" || arg == "--hf-token") {
         if (++i >= argc) {
-            invalid_param = true;
-            return true;
+          invalid_param = true;
+          return true;
         }
+        params.hf_token = argv[i];
+        return true;
+    }
+    if (arg == "-hfr" || arg == "--hf-repo") {
+        CHECK_ARG
         params.hf_repo = argv[i];
         return true;
     }
     if (arg == "-hff" || arg == "--hf-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.hf_file = argv[i];
         return true;
     }
     if (arg == "--lora") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.lora_adapter.emplace_back(argv[i], 1.0f);
-        params.use_mmap = false;
+        CHECK_ARG
+        params.lora_adapters.push_back({
+            std::string(argv[i]),
+            1.0,
+        });
         return true;
     }
     if (arg == "--lora-scaled") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        const char* lora_adapter = argv[i];
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.lora_adapter.emplace_back(lora_adapter, std::stof(argv[i]));
-        params.use_mmap = false;
+        CHECK_ARG
+        std::string lora_adapter = argv[i];
+        CHECK_ARG
+        params.lora_adapters.push_back({
+            lora_adapter,
+            std::stof(argv[i]),
+        });
         return true;
     }
-    if (arg == "--lora-base") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.lora_base = argv[i];
+    if (arg == "--lora-init-without-apply") {
+        params.lora_init_without_apply = true;
         return true;
     }
     if (arg == "--control-vector") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.control_vectors.push_back({ 1.0f, argv[i], });
         return true;
     }
     if (arg == "--control-vector-scaled") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         const char* fname = argv[i];
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.control_vectors.push_back({ std::stof(argv[i]), fname, });
         return true;
     }
     if (arg == "--control-vector-layer-range") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.control_vector_layer_start = std::stoi(argv[i]);
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.control_vector_layer_end = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--mmproj") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.mmproj = argv[i];
+        CHECK_ARG
+        params.mmproj.path = argv[i];
         return true;
     }
-    if (arg == "--image") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+    if (arg == "--mmproj-url") {
+        CHECK_ARG
+        params.mmproj.url = argv[i];
+        return true;
+    }
+    if (arg == "--no-mmproj-offload") {
+        params.mmproj_use_gpu = false;
+        return true;
+    }
+    if (arg == "--mtmd-kq-type") {
+        CHECK_ARG
+        params.mtmd_kq_type = argv[i];
+        return true;
+    }
+    if (arg == "--image" || arg == "--audio") {
+        CHECK_ARG
         params.image.emplace_back(argv[i]);
+        return true;
+    }
+    if (arg == "--image-min-tokens") {
+        CHECK_ARG
+            params.image_min_tokens = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--image-max-tokens") {
+        CHECK_ARG
+            params.image_max_tokens = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-i" || arg == "--interactive") {
@@ -920,6 +1749,21 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--embedding" || arg == "--embeddings") {
         params.embedding = true;
+        return true;
+    }
+    if (arg == "--embd-normalize") {
+        CHECK_ARG
+        params.embd_normalize = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--embd-output-format") {
+        CHECK_ARG
+        params.embd_out = argv[i];
+        return true;
+    }
+    if (arg == "--embd-separator") {
+        CHECK_ARG
+        params.embd_sep = argv[i];
         return true;
     }
     if (arg == "-if" || arg == "--interactive-first") {
@@ -950,7 +1794,68 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cache_type_v = argv[++i];
         return true;
     }
-    if (arg == "--multiline-input") {
+    if (arg == "-ictk" || arg == "--indexer-cache-type-k") {
+        params.indexer_cache_type_k = argv[++i];
+        return true;
+    }
+    if (arg == "-ctk-first" || arg == "--cache-type-k-first") {
+        CHECK_ARG
+        auto p = string_split(argv[i], ",");
+        if (p.size() != 2) {
+            invalid_param = true;
+        } else {
+            params.type_k_first = p[0];
+            params.n_k_first = std::stoi(p[1].c_str());
+        }
+        return true;
+    }
+    if (arg == "-ctk-last" || arg == "--cache-type-k-last") {
+        CHECK_ARG
+        auto p = string_split(argv[i], ",");
+        if (p.size() != 2) {
+            invalid_param = true;
+        } else {
+            params.type_k_last = p[0];
+            params.n_k_last = std::stoi(p[1].c_str());
+        }
+        return true;
+    }
+    if (arg == "-ctv-first" || arg == "--cache-type-v-first") {
+        CHECK_ARG
+        auto p = string_split(argv[i], ",");
+        if (p.size() != 2) {
+            invalid_param = true;
+        } else {
+            params.type_v_first = p[0];
+            params.n_v_first = std::stoi(p[1].c_str());
+        }
+        return true;
+    }
+    if (arg == "-ctv-last" || arg == "--cache-type-v-last") {
+        CHECK_ARG
+        auto p = string_split(argv[i], ",");
+        if (p.size() != 2) {
+            invalid_param = true;
+        } else {
+            params.type_v_last = p[0];
+            params.n_v_last = std::stoi(p[1].c_str());
+        }
+        return true;
+    }
+    if (arg == "--mtp-requantize-output-tensor" || arg == "-mtprot") {
+        CHECK_ARG
+        params.extra_output_type = argv[i];
+        return true;
+    }
+    if (arg == "-ctkd" || arg == "--cache-type-k-draft") {
+        params.speculative.cache_type_k = argv[++i];
+        return true;
+    }
+    if (arg == "-ctvd" || arg == "--cache-type-v-draft") {
+        params.speculative.cache_type_v = argv[++i];
+        return true;
+    }
+    if (arg == "-mli" || arg == "--multiline-input") {
         params.multiline_input = true;
         return true;
     }
@@ -962,8 +1867,93 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cont_batching = true;
         return true;
     }
+    if (arg == "-nocb" || arg == "--no-cont-batching") {
+        params.cont_batching = false;
+        return true;
+    }
+    if (arg == "-no-fa" || arg == "--no-flash-attn") {
+        params.flash_attn = false;
+        return true;
+    }
+
     if (arg == "-fa" || arg == "--flash-attn") {
-        params.flash_attn = true;
+        CHECK_ARG
+        std::string next_arg{argv[i]};
+        for (auto& c : next_arg) c = std::tolower(c);
+        if (next_arg == "auto" || next_arg == "1" || next_arg == "on") {
+            params.flash_attn = true;
+        }
+        else if (next_arg == "off" || next_arg == "0") {
+            params.flash_attn = false;
+        }
+        else {
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "-mla" || arg == "--mla-use") {
+        CHECK_ARG
+        params.mla_attn = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-dsa" || arg == "--dsa") {
+        params.dsa = true;
+        return true;
+    }
+    if (arg == "-dsatk" || arg == "--dsa-top-k") {
+        CHECK_ARG
+        params.dsa_top_k = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-amb" || arg == "--attention-max-batch") {
+        CHECK_ARG
+        params.attn_max_batch = std::stoi(argv[i]);
+        if (params.attn_max_batch > 0 && params.attn_max_batch < 128) {
+            LLAMA_LOG_WARN("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX amb = %d is too low. Changing to 128\n", params.attn_max_batch);
+            params.attn_max_batch = 128;
+        }
+        return true;
+    }
+    if (arg == "-no-fmoe" || arg == "--no-fused-moe") {
+        params.fused_moe_up_gate = false;
+        return true;
+    }
+    if (arg == "-ger" || arg == "--grouped-expert-routing") {
+        params.grouped_expert_routing = true;
+        return true;
+    }
+    if (arg == "-no-fug" || arg == "--no-fused-up-gate") {
+        params.fused_up_gate = false;
+        return true;
+    }
+    if (arg == "-no-mmad" || arg == "--no-fused-mul-multiadd") {
+        params.fused_mmad = false;
+        return true;
+    }
+    if (arg == "-rcache" || arg == "--rope-cache") {
+        fprintf(stderr, "=================================================================================\n");
+        fprintf(stderr, "  -rcache, --rope-cache is no longer supported\n");
+        fprintf(stderr, "=================================================================================\n");
+        //params.rope_cache = true;
+        return true;
+    }
+    if (arg == "-gr" || arg == "--graph-reuse") {
+        params.graph_reuse = true;
+        return true;
+    }
+    if (arg == "-no-gr" || arg == "--no-graph-reuse") {
+        params.graph_reuse = false;
+        return true;
+    }
+    if (arg == "-ser" || arg == "--smart-expert-reduction") {
+        CHECK_ARG
+        auto values = string_split_pairs<int,float>(argv[i], ',');
+        if (values.size() == 1) {
+            params.min_experts    = values.front().first;
+            params.thresh_experts = values.front().second;
+        } else {
+            invalid_param = true;
+        }
         return true;
     }
     if (arg == "-co" || arg == "--color") {
@@ -975,10 +1965,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-ngl" || arg == "--gpu-layers" || arg == "--n-gpu-layers") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_gpu_layers = std::stoi(argv[i]);
         if (!llama_supports_gpu_offload()) {
             fprintf(stderr, "warning: not compiled with GPU offload support, --gpu-layers option will be ignored\n");
@@ -986,12 +1973,9 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
-    if (arg == "-ngld" || arg == "--gpu-layers-draft" || arg == "--gpu-layers-draft") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.n_gpu_layers_draft = std::stoi(argv[i]);
+    if (arg == "-ngld" || arg == "--gpu-layers-draft" || arg == "--n-gpu-layers-draft") {
+        CHECK_ARG
+        params.speculative.n_gpu_layers = std::stoi(argv[i]);
         if (!llama_supports_gpu_offload()) {
             fprintf(stderr, "warning: not compiled with GPU offload support, --gpu-layers-draft option will be ignored\n");
             fprintf(stderr, "warning: see main README.md for information on enabling GPU BLAS support\n");
@@ -999,21 +1983,20 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--main-gpu" || arg == "-mg") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.main_gpu = std::stoi(argv[i]);
 #ifndef GGML_USE_CUDA_SYCL_VULKAN
         fprintf(stderr, "warning: llama.cpp was compiled without CUDA/SYCL/Vulkan. Setting the main GPU has no effect.\n");
 #endif // GGML_USE_CUDA_SYCL_VULKAN
         return true;
     }
+    else if (arg == "--max-gpu") {
+        CHECK_ARG
+        params.max_gpu = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--split-mode" || arg == "-sm") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::string arg_next = argv[i];
         if (arg_next == "none") {
             params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -1021,12 +2004,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else if (arg_next == "layer") {
             params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
-        else if (arg_next == "row") {
-#ifdef GGML_USE_SYCL
-            fprintf(stderr, "warning: The split mode value:[row] is not supported by llama.cpp with SYCL. It's developing.\nExit!\n");
-            exit(1);
-#endif // GGML_USE_SYCL
-            params.split_mode = LLAMA_SPLIT_MODE_ROW;
+        else if (arg_next == "attn") {
+            params.split_mode = LLAMA_SPLIT_MODE_ATTN;
+        }
+        else if (arg_next == "graph") {
+            params.split_mode = LLAMA_SPLIT_MODE_GRAPH;
         }
         else {
             invalid_param = true;
@@ -1038,10 +2020,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--tensor-split" || arg == "-ts") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::string arg_next = argv[i];
 
         // split string by , and /
@@ -1066,22 +2045,182 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--rpc") {
-        if (++i >= argc) {
+        CHECK_ARG
+#ifdef GGML_USE_RPC
+        std::string servers(argv[i]);
+        servers = add_rpc_devices(servers);
+        if (servers.empty()) {
+            return false;
+        }
+        params.rpc_servers = servers;
+#endif
+        return true;
+    }
+    if (arg == "--override-kv") {
+        CHECK_ARG
+            if (!string_parse_kv_override(argv[i], params.kv_overrides)) {
+                fprintf(stderr, "error: Invalid type for KV override: %s\n", argv[i]);
+                invalid_param = true;
+                return true;
+            }
+        return true;
+    }
+    if (arg == "--override-tensor" || arg == "-ot") {
+        CHECK_ARG
+        if (!parse_buft_overrides(std::string{ argv[i] }, params.tensor_buft_overrides)) {
+            fprintf(stderr, "error: Invalid tensor buffer type override: %s\n", argv[i]);
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--gpu-fit-margin" || arg == "-gfm") {
+        CHECK_ARG
+        auto p = string_split_pairs<int,int>(argv[i], ',');
+        if (p.empty()) {
+            fprintf(stderr, "error: invalid GPU split margin argument: %s\n", argv[i]);
+            invalid_param = true;
+        } else {
+            auto cur_size = params.fit_margin_array.size();
+            params.fit_margin_array.resize(cur_size + 2*p.size());
+            for (auto & pair : p) {
+                params.fit_margin_array[cur_size+0] = pair.first;
+                params.fit_margin_array[cur_size+1] = pair.second;
+                cur_size += 2;
+            }
+        }
+        return true;
+    }
+    if (arg == "-cuda" || arg == "--cuda-params") {
+        CHECK_ARG
+        params.cuda_params = argv[i];
+        return true;
+    }
+    if (arg == "-mtp" || arg == "--multi-token-prediction") {
+        throw common_speculative_legacy_option_error(arg,
+            "--spec-type mtp:n_max=1,p_min=0.0");
+    }
+    if (arg == "-no-mtp" || arg == "--no-multi-token-prediction") {
+        throw common_speculative_legacy_option_error(arg,
+            "remove the mtp entry from repeated --spec-type arguments");
+    }
+    if (arg == "-draft" || arg == "--draft-params") {
+        CHECK_ARG
+        params.speculative.params = argv[i];
+        return true;
+    }
+    if (arg == "--cpu-moe" || arg == "-cmoe") {
+        params.ncmoe = 999;
+        //params.tensor_buft_overrides.push_back({strdup("\\.ffn_(up|down|gate|gate_up)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
+        return true;
+    }
+    if (arg == "--n-cpu-moe" || arg == "-ncmoe") {
+        CHECK_ARG
+        int32_t n_layers = std::stoi(argv[i]);
+        if (n_layers < 0) {
+            fprintf(stderr, "error: Invalid value for --n-cpu-moe: %d (must be >= 0)\n", n_layers);
             invalid_param = true;
             return true;
         }
-        params.rpc_servers = argv[i];
+        params.ncmoe = n_layers;
+        //for (int32_t l = 0; l < n_layers; ++l) {
+        //    std::string pattern = "blk\\." + std::to_string(l) + "\\.(ffn_(up|down|gate|gate_up)_exps\\.weight)";
+        //    params.tensor_buft_overrides.push_back({strdup(pattern.c_str()), ggml_backend_cpu_buffer_type()});
+        //}
+        return true;
+    }
+    if (arg == "--fit") {
+        params.fit = true;
+        return true;
+    }
+    if (arg == "--defer-experts") {
+        params.defer_experts = true;
+        params.warmup = false;
+        return true;
+    }
+    if (arg == "--fit-margin") {
+        CHECK_ARG;
+        int32_t margin = std::stoi(argv[i]);
+        if (margin < 0) {
+            fprintf(stderr, "error: Invalid value for --fit-margin: %d (must be >= 0)\n", margin);
+            invalid_param = true;
+        } else {
+            params.fit_margin = margin;
+        }
+        return true;
+    }
+    if (arg == "-wgt" || arg == "--worst-graph-tokens") {
+        CHECK_ARG;
+        params.worst_graph_tokens = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--no-mmap") {
         params.use_mmap = false;
         return true;
     }
+    if (arg == "-rtr" || arg == "--run-time-repack") {
+        params.repack_tensors = true;
+        params.use_mmap = false;
+        return true;
+    }
+    if (arg == "-thp" || arg == "--transparent-huge-pages") {
+        params.use_thp = true;
+        return true;
+    }
+    if (arg == "-vq" || arg == "--validate-quants") {
+        params.validate_quants = true;
+        return true;
+    }
+    if (arg == "-mqkv" || arg == "--merge-qkv") {
+        params.merge_qkv = true;
+        return true;
+    }
+    if (arg == "-muge" || arg == "--merge-up-gate-experts") {
+        params.merge_up_gate_exps = true;
+        return true;
+    }
+    if (arg == "-khad" || arg == "--k-cache-hadamard") {
+        params.k_cache_hadamard = true;
+        return true;
+    }
+    if (arg == "-vhad" || arg == "--v-cache-hadamard") {
+        params.v_cache_hadamard = true;
+        return true;
+    }
+    if (arg == "-smgs" || arg == "--split-mode-graph-scheduling") {
+        params.split_mode_graph_scheduling = true;
+        return true;
+    }
+    if (arg == "-sas" || arg == "--scheduler-async") {
+        params.scheduler_async = true;
+        return true;
+    }
+    if (arg == "-fdn" || arg == "--fused-delta-net") {
+        CHECK_ARG
+        fprintf(stderr, "=================== %s has been deprecated\n", arg.c_str());
+        return true;
+    }
+    if (arg == "-smf16" || arg == "--split-mode-f16") {
+        params.reduce_type = "f16";
+        //params.split_mode_f16 = true;
+        return true;
+    }
+    if (arg == "-smf32" || arg == "--split-mode-f32") {
+        params.reduce_type = "f32";
+        //params.split_mode_f16 = false;
+        return true;
+    }
+    if (arg == "-grt" || arg == "--graph-reduce-type") {
+        CHECK_ARG
+        params.reduce_type = argv[i];
+        return true;
+    }
+    if (arg == "-gap" || arg == "--graph-attn-precision") {
+        CHECK_ARG
+        params.graph_attn_precision = argv[i];
+        return true;
+    }
     if (arg == "--numa") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::string value(argv[i]);
         /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
         else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
@@ -1089,15 +2228,24 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else { invalid_param = true; }
         return true;
     }
+    if (arg == "-dev" || arg == "--device") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        params.devices = parse_device_list(value);
+        return true;
+    }
+    if (arg == "-devd" || arg == "--device-draft") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        params.speculative.devices = parse_device_list(value);
+        return true;
+    }
     if (arg == "-v" || arg == "--verbose") {
         params.verbosity = 1;
         return true;
     }
     if (arg == "--verbosity") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.verbosity = std::stoi(argv[i]);
         return true;
     }
@@ -1110,18 +2258,61 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-r" || arg == "--reverse-prompt") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.antiprompt.emplace_back(argv[i]);
         return true;
     }
-    if (arg == "-ld" || arg == "--logdir") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
+    if (arg == "--banned-string-file") {
+        CHECK_ARG
+        std::string files = read_file(std::string(argv[i]));
+        std::vector<std::string> ban_strings=string_split(files, "\n");
+        std::vector<std::string> ban_phrases;
+        for (auto& str : ban_strings) {
+            std::erase(str, '"');
+            if (!str.empty()) {
+                ban_phrases.push_back(str);
+            }
         }
+        params.ban_phrases = ban_phrases;
+        return true;
+    }
+    if (arg == "--banned-n") {
+        CHECK_ARG
+        params.banned_n = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--allowlist-unicode-rule") {
+        CHECK_ARG
+        if (params.allow_ruless.size() == 0) {
+            params.allow_ruless.push_back({});
+        }
+        params.allow_ruless.back().push_back(argparse_allowlist_unicode_rule(argv[i]));
+        return true;
+    }
+    if (arg == "--allowlist-pieces") {
+        CHECK_ARG
+        params.allow_pieces.push_back(argv[i]);
+        return true;
+    }
+    if (arg == "--allowlist-keyword") {
+        CHECK_ARG
+        params.allow_kws.push_back(argv[i]);
+        params.allow_ruless.push_back({});
+        return true;
+    }
+    if (arg == "--allowlist-keyword-delay") {
+        CHECK_ARG
+        params.allow_kw_delay = std::stoul(argv[i]);
+        return true;
+    }
+    if (arg == "--expiring-logit-bias-file") {
+        CHECK_ARG
+        std::string content = read_file(argv[i]);
+        argparse_expiring_logit_bias(content, sparams);
+        return true;
+    }
+    if (arg == "-ld" || arg == "--logdir") {
+        CHECK_ARG
         params.logdir = argv[i];
 
         if (params.logdir.back() != DIRECTORY_SEPARATOR) {
@@ -1130,26 +2321,17 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-lcs" || arg == "--lookup-cache-static") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.lookup_cache_static = argv[i];
         return true;
     }
     if (arg == "-lcd" || arg == "--lookup-cache-dynamic") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.lookup_cache_dynamic = argv[i];
         return true;
     }
     if (arg == "--save-all-logits" || arg == "--kl-divergence-base") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.logits_file = argv[i];
         return true;
     }
@@ -1158,26 +2340,17 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--ppl-stride") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.ppl_stride = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--ppl-output-type") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.ppl_output_type = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-ptc" || arg == "--print-token-count") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_print = std::stoi(argv[i]);
         return true;
     }
@@ -1190,10 +2363,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--hellaswag-tasks") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.hellaswag_tasks = std::stoi(argv[i]);
         return true;
     }
@@ -1202,10 +2372,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--winogrande-tasks") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.winogrande_tasks = std::stoi(argv[i]);
         return true;
     }
@@ -1214,10 +2381,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--multiple-choice-tasks") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.multiple_choice_tasks = std::stoi(argv[i]);
         return true;
     }
@@ -1234,10 +2398,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-l" || arg == "--logit-bias") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::stringstream ss(argv[i]);
         llama_token key;
         char sign;
@@ -1265,109 +2426,103 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         fprintf(stderr, "built with %s for %s\n", LLAMA_COMPILER, LLAMA_BUILD_TARGET);
         exit(0);
     }
+    if (arg == "--dry-run" || arg == "-dr") {
+        params.dry_run = true;
+        return true;
+    }
     if (arg == "--in-prefix-bos") {
         params.input_prefix_bos = true;
+        params.enable_chat_template = false;
         return true;
     }
     if (arg == "--in-prefix") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.input_prefix = argv[i];
+        params.enable_chat_template = false;
         return true;
     }
     if (arg == "--in-suffix") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.input_suffix = argv[i];
+        params.enable_chat_template = false;
+        return true;
+    }
+    if (arg == "--spm-infill") {
+        params.spm_infill = true;
         return true;
     }
     if (arg == "--grammar") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        sparams.grammar = argv[i];
+        CHECK_ARG
+            sparams.grammar = { COMMON_GRAMMAR_TYPE_USER, argv[i] };
         return true;
     }
     if (arg == "--grammar-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i]);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
             invalid_param = true;
             return true;
         }
-        std::copy(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>(),
-            std::back_inserter(sparams.grammar)
-        );
+        sparams.grammar = {COMMON_GRAMMAR_TYPE_USER, read_file(argv[i])};
         return true;
     }
     if (arg == "-j" || arg == "--json-schema") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        sparams.grammar = json_schema_to_grammar(json::parse(argv[i]));
+        CHECK_ARG
+        sparams.grammar = { COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT,  json_schema_to_grammar(json::parse(argv[i]))};
         return true;
     }
-    if (arg == "--override-kv") {
-        if (++i >= argc) {
+
+    if (arg == "--offload-policy" || arg == "-op") {
+        CHECK_ARG
+        auto p = string_split_pairs<int,int>(argv[i], ',');
+        if (p.empty()) {
+            fprintf(stderr, "error: Invalid offload policy argument: %s\n", argv[i]);
             invalid_param = true;
-            return true;
+        } else {
+            params.offload_policy.insert(params.offload_policy.end(), p.begin(), p.end());
         }
-        if (!string_parse_kv_override(argv[i], params.kv_overrides)) {
-            fprintf(stderr, "error: Invalid type for KV override: %s\n", argv[i]);
-            invalid_param = true;
-            return true;
-        }
+        return true;
+    }
+    if (arg == "--no-offload-only-active-experts" || arg == "-no-ooae") {
+        params.only_active_exps = false;
         return true;
     }
     if (arg == "--host") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.hostname = argv[i];
         return true;
     }
     if (arg == "--port") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.port = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--send-done") {
+        params.send_done = true;
+        return true;
+    }
     if (arg == "--path") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.public_path = argv[i];
         return true;
     }
+    if (arg == "--webui") {
+        CHECK_ARG
+        params.webui = common_webui_from_name(std::string(argv[i]));
+        return true;
+    }
+    if (arg == "--webui-mcp-proxy" || arg == "--ui-mcp-proxy") {
+        params.webui_mcp_proxy = true;
+        return true;
+    }
     if (arg == "--api-key") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.api_keys.push_back(argv[i]);
         return true;
     }
     if (arg == "--api-key-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream key_file(argv[i]);
         if (!key_file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -1384,43 +2539,28 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--ssl-key-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.ssl_file_key = argv[i];
         return true;
     }
     if (arg == "--ssl-cert-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.ssl_file_cert = argv[i];
         return true;
     }
     if (arg == "--timeout" || arg == "-to") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.timeout_read  = std::stoi(argv[i]);
         params.timeout_write = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--threads-http") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_threads_http = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-spf" || arg == "--system-prompt-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i]);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -1437,10 +2577,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--log-format") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         if (std::strcmp(argv[i], "json") == 0) {
             params.log_json = true;
         } else if (std::strcmp(argv[i], "text") == 0) {
@@ -1460,10 +2597,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--slot-save-path") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.slot_save_path = argv[i];
         // if doesn't end with DIRECTORY_SEPARATOR, add it
         if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
@@ -1471,12 +2605,29 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--reasoning-tokens") {
+        CHECK_ARG
+        params.think_tokens = thinking_tokens_from_string(std::string(argv[i]));
+        return true;
+    }
+    if (arg == "--reasoning-budget") {
+        CHECK_ARG
+        params.reasoning_budget = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--sql-save-file") {
+        CHECK_ARG
+        params.sql_save_file = argv[i];
+        return true;
+    }
+    if (arg == "--sqlite-zstd-ext-file") {
+        CHECK_ARG
+        params.sqlite_zstd_ext_file = argv[i];
+        return true;
+    }
     if (arg == "--chat-template") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        if (!llama_chat_verify_template(argv[i])) {
+        CHECK_ARG
+        if (!common_chat_verify_template(argv[i], true)) {
             fprintf(stderr, "error: the supplied chat template is not supported: %s\n", argv[i]);
             fprintf(stderr, "note: llama.cpp does not use jinja parser, we only support commonly used templates\n");
             invalid_param = true;
@@ -1485,11 +2636,82 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.chat_template = argv[i];
         return true;
     }
-    if (arg == "--slot-prompt-similarity" || arg == "-sps") {
-        if (++i >= argc) {
+    if (arg == "--chat-template-file") {
+        CHECK_ARG
+        std::string chat_template = read_file(std::string(argv[i]));
+        if (!common_chat_verify_template(chat_template, true)) {
+            fprintf(stderr, "error: the supplied chat template is not supported: %s\n", argv[i]);
             invalid_param = true;
             return true;
         }
+        params.chat_template = chat_template;
+        return true;
+    }
+    if (arg == "--jinja") {
+        params.use_jinja = true;
+        return true;
+    }
+    if (arg == "--peg") {
+        return true;
+    }
+    if (arg == "--chat-template-kwargs") {
+        CHECK_ARG
+        std::string value = argv[i];
+        auto parsed = json::parse(value);
+        for (const auto& item : parsed.items()) {
+            if (item.key() == "enable_thinking") {
+                LOG_WRN("Setting 'enable_thinking' via --chat-template-kwargs is deprecated. "
+                    "Use --reasoning on / --reasoning off instead.\n");
+            }
+            params.default_template_kwargs[item.key()] = item.value().dump();
+        }
+        return true;
+    }
+    if (arg == "--reasoning-format") {
+        CHECK_ARG
+        std::string value = argv[i];
+        params.reasoning_format = common_reasoning_format_from_name(value);
+        return true;
+    }
+    if (arg == "-rea" || arg == "--reasoning") {
+        CHECK_ARG
+        std::string value = argv[i];
+        if (is_truthy(value)) {
+            params.enable_reasoning = 1;
+            params.default_template_kwargs["enable_thinking"] = "true";
+        } else if (is_falsey(value)) {
+            params.enable_reasoning = 0;
+            params.default_template_kwargs["enable_thinking"] = "false";
+        } else if (is_autoy(value)) {
+            params.enable_reasoning = -1;
+        } else {
+            throw std::invalid_argument(
+                string_format("error: unknown value for --reasoning: '%s'\n", value.c_str()));
+        }
+        return true;
+    }
+    if (arg == "--reasoning-budget-message") {
+        CHECK_ARG
+        std::string value = argv[i];
+        params.reasoning_budget_message = value;
+        return true;
+    }
+    if (arg == "--skip-chat-parsing") {
+        CHECK_ARG
+        params.force_pure_content_parser = true;
+        return true;
+    }
+    if (arg == "--no-prefill-assistant") {
+        CHECK_ARG
+        params.prefill_assistant = false;
+        return true;
+    }
+    if (arg == "--parallel-tool-calls") {
+        params.parallel_tool_calls = true;
+        return true;
+    }
+    if (arg == "--slot-prompt-similarity" || arg == "-sps") {
+        CHECK_ARG
         params.slot_prompt_similarity = std::stof(argv[i]);
         return true;
     }
@@ -1498,37 +2720,25 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-npp") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         auto p = string_split<int>(argv[i], split_delim);
         params.n_pp.insert(params.n_pp.end(), p.begin(), p.end());
         return true;
     }
     if (arg == "-ntg") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         auto p = string_split<int>(argv[i], split_delim);
         params.n_tg.insert(params.n_tg.end(), p.begin(), p.end());
         return true;
     }
     if (arg == "-npl") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         auto p = string_split<int>(argv[i], split_delim);
         params.n_pl.insert(params.n_pl.end(), p.begin(), p.end());
         return true;
     }
     if (arg == "--context-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         std::ifstream file(argv[i], std::ios::binary);
         if (!file) {
             fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
@@ -1539,59 +2749,98 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "--chunk-size") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.chunk_size = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--chunk-separator") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.chunk_separator = argv[i];
         return true;
     }
     if (arg == "--junk") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_junk = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--pos") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
+    if (arg == "--no-context-shift") {
+        params.ctx_shift = false;
+        return true;
+    }
+    if (arg == "--context-shift") {
+        CHECK_ARG
+        std::string next_arg{ argv[i] };
+        for (auto& c : next_arg) c = std::tolower(c);
+        if (next_arg == "auto" || next_arg == "1" || next_arg == "on") {
+            params.ctx_shift = true;
         }
+        else if (next_arg == "off" || next_arg == "0") {
+            params.ctx_shift = false;
+        }
+        else {
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--ctx-checkpoints") {
+        CHECK_ARG
+        params.ctx_checkpoints_n = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--ctx-checkpoints-interval") {
+        CHECK_ARG
+        params.ctx_checkpoints_interval = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--ctx-checkpoints-tolerance") {
+        CHECK_ARG
+        params.ctx_checkpoints_tolerance = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--ctx-checkpoints-eviction") {
+        CHECK_ARG
+        params.ctx_checkpoint_eviction= common_checkpoint_eviction_from_name(std::string(argv[i]));
+        return true;
+    }
+    if (arg == "-cram" || arg == "--cache-ram") {
+        CHECK_ARG
+        params.cache_ram_mib = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-crs" || arg == "--cache-ram-similarity") {
+        CHECK_ARG
+        params.cache_ram_similarity = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "-cram-n-min" || arg == "--cache-ram-n-min") {
+        CHECK_ARG
+        params.cache_ram_n_min = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--pos") {
+        CHECK_ARG
         params.i_pos = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-o" || arg == "--output" || arg == "--output-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.out_file = argv[i];
         params.cvector_outfile = argv[i];
+        params.lora_outfile = argv[i];
+        return true;
+    }
+    if (arg == "--output-draft" || arg == "--draft-output" || arg == "--draft-output-file") {
+        CHECK_ARG
+        params.out_file_draft = argv[i];
         return true;
     }
     if (arg == "-ofreq" || arg == "--output-frequency") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_out_freq = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--save-frequency") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_save_freq = std::stoi(argv[i]);
         return true;
     }
@@ -1599,67 +2848,73 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.process_output = true;
         return true;
     }
+    if (arg == "--output-tensor-name") {
+        if (++i >= argc) {
+            invalid_param = true;
+            return true;
+        }
+        params.output_tensor_name = argv[i];
+        return true;
+    }
     if (arg == "--no-ppl") {
         params.compute_ppl = false;
         return true;
     }
     if (arg == "--chunk" || arg == "--from-chunk") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.i_chunk = std::stoi(argv[i]);
         return true;
     }
     // cvector params
-    if (arg == "--completions-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.cvector_completions_file = argv[i];
-        return true;
-    }
     if (arg == "--positive-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.cvector_positive_file = argv[i];
         return true;
     }
     if (arg == "--negative-file") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.cvector_negative_file = argv[i];
         return true;
     }
-    if (arg == "--completions") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
-        params.n_completions = std::stoi(argv[i]);
-        return true;
-    }
     if (arg == "--pca-batch") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_pca_batch = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--pca-iter") {
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         params.n_pca_iterations = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--method") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        /**/ if (value == "pca") { params.cvector_dimre_method = DIMRE_METHOD_PCA; }
+        else if (value == "mean") { params.cvector_dimre_method = DIMRE_METHOD_MEAN; }
+        else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--no-warmup") {
+        params.warmup = false;
+        return true;
+    }
+    if (arg == "--warmup-batch" || arg == "-wb") {
+        params.batch_warmup = true;
+        return true;
+    }
+    if (arg == "--output-format") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        /**/ if (value == "jsonl") { params.sweep_bench_output_jsonl = true; }
+        else if (value == "md") { params.sweep_bench_output_jsonl = false; }
+        else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--minilog") {
+        params.minilog = true;
+        return true;
+    }
+
 #ifndef LOG_DISABLE_LOGS
     // Parse args for logging parameters
     if (log_param_single_parse(argv[i])) {
@@ -1671,10 +2926,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         // We have a matching known parameter requiring an argument,
         //  now we need to check if there is anything after this argv
         //  and flag invalid_param or parse it.
-        if (++i >= argc) {
-            invalid_param = true;
-            return true;
-        }
+        CHECK_ARG
         if (!log_param_pair_parse( /*check_but_dont_parse*/ false, argv[i - 1], argv[i])) {
             invalid_param = true;
             return true;
@@ -1698,7 +2950,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
 #endif
 
 void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
-    const llama_sampling_params & sparams = params.sparams;
+    const common_params_sampling & sparams = params.sparams;
 
     std::string sampler_type_chars;
     std::string sampler_type_names;
@@ -1735,17 +2987,19 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-h,    --help, --usage",        "print usage and exit" });
     options.push_back({ "*",           "       --version",              "show version and build info" });
     options.push_back({ "*",           "-v,    --verbose",              "print verbose information" });
+    options.push_back({ "*",           "       --minilog",              "print important information" });
     options.push_back({ "*",           "       --verbosity N",          "set specific verbosity level (default: %d)", params.verbosity });
     options.push_back({ "*",           "       --verbose-prompt",       "print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false" });
+    options.push_back({ "*",           "-dr,   --dry-run",       "skip loading tensors in the files"});
     options.push_back({ "*",           "       --no-display-prompt",    "don't print prompt at generation (default: %s)", !params.display_prompt ? "true" : "false" });
     options.push_back({ "*",           "-co,   --color",                "colorise output to distinguish prompt and user input from generations (default: %s)", params.use_color ? "true" : "false" });
     options.push_back({ "*",           "-s,    --seed SEED",            "RNG seed (default: %d, use random seed for < 0)", params.seed });
     options.push_back({ "*",           "-t,    --threads N",            "number of threads to use during generation (default: %d)", params.n_threads });
     options.push_back({ "*",           "-tb,   --threads-batch N",      "number of threads to use during batch and prompt processing (default: same as --threads)" });
+    options.push_back({ "multi-modality", "-tm,   --threads-mtmd N",    "number of threads to use during multimodal image processing (default: same as --threads-batch)" });
     options.push_back({ "speculative", "-td,   --threads-draft N",      "number of threads to use during generation (default: same as --threads)" });
     options.push_back({ "speculative", "-tbd,  --threads-batch-draft N",
                                                                         "number of threads to use during batch and prompt processing (default: same as --threads-draft)" });
-    options.push_back({ "speculative", "       --draft N",              "number of tokens to draft for speculative decoding (default: %d)", params.n_draft });
     options.push_back({ "speculative", "-ps,   --p-split N",            "speculative decoding split probability (default: %.1f)", (double)params.p_split });
     options.push_back({ "*",           "-lcs,  --lookup-cache-static FNAME",
                                                                         "path to static lookup cache to use for lookup decoding (not updated by generation)" });
@@ -1753,13 +3007,48 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "path to dynamic lookup cache to use for lookup decoding (updated by generation)" });
 
     options.push_back({ "*",           "-c,    --ctx-size N",           "size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx });
+    options.push_back({ "*",           "-cd,   --ctx-size-draft N",     "size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.n_ctx });
+
+    options.push_back({ "*",           "--ctx-checkpoints N",           "max number of context checkpoints to create per slot (default: %d)",params.ctx_checkpoints_n});
+    options.push_back({ "*",           "--ctx-checkpoints-interval N",  "minimum number of tokens between each context checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_interval});
+    options.push_back({ "*",           "--ctx-checkpoints-tolerance N", "the number of tokens before the full prompt to create the checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_tolerance});
+    options.push_back({ "*",           "--ctx-checkpoints-eviction NAME", "Eviction strategy for checkpoint. Accepts fifo, variance and auto. Auto defaults to variance. Variance preserves coverage and maintains uniform interval.  (default: variance)" });
+    options.push_back({ "*",           "-cram, --cache-ram N",          "set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)",params.cache_ram_mib });
+    options.push_back({ "*",           "-crs,  --cache-ram-similarity N",           "max of similarity of prompt tokens to cache tokens that triggers prompt cache (default: %.2f).",params.cache_ram_similarity });
+    options.push_back({ "*",           "-cram-n-min --cache-ram-n-min N",           "minimum number of the cached tokens that triggers prompt cache (default: %d).", params.cache_ram_n_min });
     options.push_back({ "*",           "-n,    --predict N",            "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)", params.n_predict });
     options.push_back({ "*",           "-b,    --batch-size N",         "logical maximum batch size (default: %d)", params.n_batch });
     options.push_back({ "*",           "-ub,   --ubatch-size N",        "physical maximum batch size (default: %d)", params.n_ubatch });
     options.push_back({ "*",           "       --keep N",               "number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep });
     options.push_back({ "*",           "       --chunks N",             "max number of chunks to process (default: %d, -1 = all)", params.n_chunks });
-    options.push_back({ "*",           "-fa,   --flash-attn",           "enable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
-    options.push_back({ "*",           "-p,    --prompt PROMPT",        "prompt to start generation with (default: '%s')", params.prompt.c_str() });
+    options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
+    options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
+    options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
+    options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
+    options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-no-mmad, --no-fused-mul-multiadd", "disable fused mul-multi_add (default: %s)", params.fused_mmad? "enabled" : "disabled" });
+    //options.push_back({ "*",           "-rcache, --rope-cache",         "enable RoPE cache (default: %s)", params.rope_cache ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-gr, --graph-reuse",            "enable graph reuse (default: %s)", params.graph_reuse ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-no-gr, --no-graph-reuse",      "disable graph reuse (default: %s)", !params.graph_reuse ? "enabled" : "disabled" });
+    options.push_back({ "*",         "-ser,  --smart-expert-reduction", "experts reduction (default: %d,%g)", params.min_experts, params.thresh_experts});
+    options.push_back({ "*",         "-mqkv,  --merge-qkv,",            "merge Q,K,V (default: %d)", params.merge_qkv});
+    options.push_back({ "*",         "-muge,  --merge-up-gate-experts,","merge ffn_up/gate_exps (default: %d)", params.merge_up_gate_exps});
+    options.push_back({ "*",         "-khad,  --k-cache-hadamard,",     "Use Hadamard transform for K-cache (default: %d)", params.k_cache_hadamard});
+    options.push_back({ "*",         "-vhad,  --v-cache-hadamard,",     "Use Hadamard transform for V-cache (default: %d)", params.v_cache_hadamard});
+    options.push_back({ "*",         "-smf16, --split-mode-f16,",       "Use f16 for data exchange between GPUs (default: %d)", true});
+    options.push_back({ "*",         "-smf32, --split-mode-f32,",       "Use f32 for data exchange between GPUs (default: %d)", false});
+    options.push_back({ "*",         "-grt, --graph-reduce-type",       "Type for data exchange between GPUs (default: %s)", "f32"});
+    options.push_back({ "*",         "-gap, --graph-attn-precision",    "Flash-attn precision under -sm graph (default: %s)", "f16"});
+    options.push_back({ "*",         "-smgs, --split-mode-graph-scheduling,", "Force Split Mode Graph Scheduling (default: %d)", params.split_mode_graph_scheduling});
+    options.push_back({ "*",         "-sas,  --scheduler_async,",       "Async evaluation of compute graphs: %d)", params.scheduler_async});
+    options.push_back({ "*",         "-vq, --validate-quants",          "validate quantized data while loading the model (default: %d)", params.validate_quants});
+    options.push_back({ "*",           "-p,    --prompt PROMPT",        "prompt to start generation with\n"
+                                                                        "in conversation mode, this will be used as system prompt\n"
+                                                                        "(default: '%s')", params.prompt.c_str() });
     options.push_back({ "*",           "-f,    --file FNAME",           "a file containing the prompt (default: none)" });
     options.push_back({ "*",           "       --in-file FNAME",        "an input file (repeat to specify multiple files)" });
     options.push_back({ "*",           "-bf,   --binary-file FNAME",    "binary file containing the prompt (default: none)" });
@@ -1774,13 +3063,18 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "halt generation at PROMPT, return control in interactive mode\n"
                                                                         "can be specified more than once for multiple prompts" });
     options.push_back({ "main",        "-sp,   --special",              "special tokens output enabled (default: %s)", params.special ? "true" : "false" });
-    options.push_back({ "main",        "-cnv,  --conversation",         "run in conversation mode (does not print special tokens and suffix/prefix) (default: %s)", params.conversation ? "true" : "false" });
+    options.push_back({ "main",        "-cnv,  --conversation",         "run in conversation mode, does not print special tokens and suffix/prefix\n"
+                                                                        "if suffix/prefix are not specified, default chat template will be used\n"
+                                                                        "(default: %s)", params.conversation ? "true" : "false" });
     options.push_back({ "main infill", "-i,    --interactive",          "run in interactive mode (default: %s)", params.interactive ? "true" : "false" });
     options.push_back({ "main infill", "-if,   --interactive-first",    "run in interactive mode and wait for input right away (default: %s)", params.interactive_first ? "true" : "false" });
     options.push_back({ "main infill", "-mli,  --multiline-input",      "allows you to write or paste multiple lines without ending each in '\\'" });
     options.push_back({ "main infill", "       --in-prefix-bos",        "prefix BOS to user inputs, preceding the `--in-prefix` string" });
     options.push_back({ "main infill", "       --in-prefix STRING",     "string to prefix user inputs with (default: empty)" });
     options.push_back({ "main infill", "       --in-suffix STRING",     "string to suffix after user inputs with (default: empty)" });
+    options.push_back({ "main",        "       --no-warmup",            "skip warming up the model with an empty run" });
+    options.push_back({ "server infill",
+                                       "       --spm-infill",           "use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: %s)", params.spm_infill ? "enabled" : "disabled" });
 
     options.push_back({ "sampling" });
     options.push_back({ "*",           "       --samplers SAMPLERS",    "samplers that will be used for generation in the order, separated by \';\'\n"
@@ -1806,25 +3100,77 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "(default: %d, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)", sparams.mirostat });
     options.push_back({ "*",           "       --mirostat-lr N",        "Mirostat learning rate, parameter eta (default: %.1f)", (double)sparams.mirostat_eta });
     options.push_back({ "*",           "       --mirostat-ent N",       "Mirostat target entropy, parameter tau (default: %.1f)", (double)sparams.mirostat_tau });
+    options.push_back({ "*",           "       --xtc-probability p",    "xtc probability (default: %.1f, 0.0 = disabled)", (double)sparams.xtc_probability });
+    options.push_back({ "*",           "       --xtc-threshold t",      "xtc threshold (default: %.1f, >0.5 = disabled)", (double)sparams.xtc_threshold});
+    options.push_back({ "*",           "       --top-n-sigma t",        "top-n-sigma parmeter (default: %.1f, 0.0 = disabled)", (double)sparams.top_n_sigma});
+    options.push_back({ "*",           "       --adaptive-target",      "adaptive-p sampling: (default: %.2f, <0.0 = disabled)", (double)sparams.adaptive_target});
+    options.push_back({ "*",           "       --adaptive-decay",       "adaptive-p sampling: (default: %.2f)", (double)sparams.adaptive_decay});
+    options.push_back({ "*",           "       --adaptive-updt-w-cur",  "adaptive-p sampling: (default: %s)", sparams.adaptive_updt_w_cur ? "true" : "false"});
+    options.push_back({ "*",           "       --banned-string-file",   "file path of the list of banned strings on each line" });
+    options.push_back({ "*",           "       --banned-n",             "number of tokens banned in the phrase during rewind. -1 means all tokens: (default: %d)",params.banned_n });
+    options.push_back({ "*",           "       --allowlist-unicode-rule",
+                                                                        "rule for allowlisting unicode script and/or codepoints. disabled without any rule. format: `LOWER..UPPER,SCRIPT:BIAS`\n"
+                                                                        "if unspecified: LOWER = 0, UPPER = -1(=max), SCRIPT=\"\", BIAS = 0. at least one of LOWER, UPPER, or SCRIPT is required\n" });
+    options.push_back({ "*",           "       --allowlist-pieces",     "allowlist each token in argument. inherits max BIAS in --allowlist-unicode-rule. overrides --allowlist-unicode-rule" });
+    options.push_back({ "*",           "       --allowlist-keyword",    "keyword to expire earlier allowlist rules if matched during generation. does not affect later rules" });
+    options.push_back({ "*",           "       --allowlist-keyword-delay",
+                                                                        "# tokens to delay matching for the first keyword (default: %zu)", params.allow_kw_delay });
     options.push_back({ "*",           "       -l TOKEN_ID(+/-)BIAS",   "modifies the likelihood of token appearing in the completion,\n"
                                                                         "i.e. `--logit-bias 15043+1` to increase likelihood of token ' Hello',\n"
                                                                         "or `--logit-bias 15043-1` to decrease likelihood of token ' Hello'" });
+    options.push_back({ "*",           "       --expiring-logit-bias-file",
+                                                                        "original PR: https://github.com/ikawrakow/ik_llama.cpp/pull/1731\n"});
     options.push_back({ "main",        "       --cfg-negative-prompt PROMPT",
                                                                         "negative prompt to use for guidance (default: '%s')", sparams.cfg_negative_prompt.c_str() });
     options.push_back({ "main",        "       --cfg-negative-prompt-file FNAME",
                                                                         "negative prompt file to use for guidance" });
     options.push_back({ "main",        "       --cfg-scale N",          "strength of guidance (default: %.1f, 1.0 = disable)", (double)sparams.cfg_scale });
+    options.push_back({ "template" });
+    options.push_back({ "main",        "       --jinja",
+                                                                        "set custom jinja chat template (default: template taken from model's metadata)\n"
+                                                                        "if suffix/prefix are specified, template will be disabled\n"
+                                                                        "only commonly used templates are accepted:\n"
+                                                                        "https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template" });
+    options.push_back({ "main",        "       --parallel-tool-calls",  "enable parallel tool calls\n" });
+    options.push_back({ "main",        "       --chat-template JINJA_TEMPLATE",
+                                                                        "use jinja template for chat (default: disabled)\n" });
+    options.push_back({ "main",        "       --chat-template-file file_with_JINJA_TEMPLATE",
+                                                                        "load jinja template for chat from the file\n" });
+    options.push_back({ "main",        "       --reasoning-format FORMAT",
+                                                                 "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
+                        "- none: leaves thoughts unparsed in `message.content`\n"
+                        "- deepseek: puts thoughts in `message.reasoning_content` (except in streaming mode, which behaves as `none`)\n"
+                        "- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`\n"
+                        "(default: none)", });
+    options.push_back({ "main",        "-rea,  --reasoning",  "[on|off|auto]"
+                                                                 "Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))" });
+    options.push_back({ "main",        "       --chat-template-kwargs JSON",  "sets additional params for the json template parser"});
 
+    options.push_back({ "main",        "       --reasoning-budget N",  "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)" });
+    options.push_back({ "main",        "       --reasoning-tokens FORMAT",     "exclude reasoning tokens to select the slot more accurately.\n"
+						                                                                                            "none: include all tokens\n"
+                                                                                                                    "auto: exclude all tokens between <think> and </think>\n"
+						                                                                                            "Or comma separated start and end tokens such as [THINK],[/THINK]\n"
+						                                                                                            "(default: auto)" });
+    options.push_back({ "main",        "       --reasoning-budget-message",  "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)" });
+    options.push_back({ "main",        "       --skip-chat-parsing",  "force a pure content parser, even if a Jinja template is specified; model will output everything "
+            "in the content section, including any reasoning and/or tool calls (default: disabled)" });
+    options.push_back({ "main",        "       --reasoning-budget N",  "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)" });
+    options.push_back({ "main",        "       --no-prefill-assistant",  "whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"
+            "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n" });
+    options.push_back({ "main",        "       -ptc, --parallel-tool-calls", "enable parallel tool calls\n" });
     options.push_back({ "grammar" });
-    options.push_back({ "*",           "       --grammar GRAMMAR",      "BNF-like grammar to constrain generations (see samples in grammars/ dir) (default: '%s')", sparams.grammar.c_str() });
+    options.push_back({ "*",           "       --grammar GRAMMAR",      "BNF-like grammar to constrain generations (see samples in grammars/ dir) (default: '%s')", sparams.grammar.grammar.c_str() });
     options.push_back({ "*",           "       --grammar-file FNAME",   "file to read grammar from" });
     options.push_back({ "*",           "-j,    --json-schema SCHEMA",
                                                                         "JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object\n"
                                                                         "For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead" });
 
     options.push_back({ "embedding" });
-    options.push_back({ "embedding",   "       --pooling {none,mean,cls}",
+    options.push_back({ "embedding",   "       --pooling {none,mean,cls,last}",
                                                                         "pooling type for embeddings, use model default if unspecified" });
+    options.push_back({ "embedding",   "       --attention {causal,non-causal}",
+                                                                        "attention type for embeddings, use model default if unspecified" });
 
     options.push_back({ "context hacking" });
     options.push_back({ "*",           "       --rope-scaling {none,linear,yarn}",
@@ -1842,7 +3188,15 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dkvc, --dump-kv-cache",        "verbose print of the KV cache" });
     options.push_back({ "*",           "-nkvo, --no-kv-offload",        "disable KV offload" });
     options.push_back({ "*",           "-ctk,  --cache-type-k TYPE",    "KV cache data type for K (default: %s)", params.cache_type_k.c_str() });
+    options.push_back({ "*",           "-ictk, --indexer-cache-type-k TYPE", "indexer K-cache data type (default: %s)", params.indexer_cache_type_k.c_str() });
     options.push_back({ "*",           "-ctv,  --cache-type-v TYPE",    "KV cache data type for V (default: %s)", params.cache_type_v.c_str() });
+    options.push_back({ "*",           "-ctk-first, --cache-type-k-first TYPE,N", "KV cache data type for the first N layers of K (default: %s,-1)", params.type_k_first.c_str() });
+    options.push_back({ "*",           "-ctv-last,  --cache-type-k-last  TYPE,N", "KV cache data type for the last N layers of K  (default: %s,-1)", params.type_k_last.c_str() });
+    options.push_back({ "*",           "-ctv-first, --cache-type-v-first TYPE,N", "KV cache data type for the first N layers of V (default: %s,-1)", params.type_v_first.c_str() });
+    options.push_back({ "*",           "-ctk-last,  --cache-type-v-last  TYPE,N", "KV cache data type for the last N layers of V  (default: %s,-1)", params.type_v_last.c_str() });
+    options.push_back({ "*",           "-mtprot, --mtp-requantize-output-tensor type", "Use output requantized to type for MTP (default: %s)", params.extra_output_type.c_str() });
+    options.push_back({ "*",           "-ctkd, --cache-type-k-draft TYPE", "KV cache data type for K for the draft model" });
+    options.push_back({ "*",           "-ctvd, --cache-type-v-draft TYPE", "KV cache data type for V for the draft model" });
 
     options.push_back({ "perplexity" });
     options.push_back({ "perplexity",  "       --all-logits",           "return logits for all tokens in the batch (default: %s)", params.logits_all ? "true" : "false" });
@@ -1860,23 +3214,37 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
 
     options.push_back({ "parallel" });
     options.push_back({ "*",           "-dt,   --defrag-thold N",       "KV cache defragmentation threshold (default: %.1f, < 0 - disabled)", (double)params.defrag_thold });
+    options.push_back({ "*",           "-mea,  --max-extra-alloc",      "Max extra VRAM allocation per GPU (default: %d)", params.max_extra_alloc_MiB});
     options.push_back({ "*",           "-np,   --parallel N",           "number of parallel sequences to decode (default: %d)", params.n_parallel });
     options.push_back({ "*",           "-ns,   --sequences N",          "number of sequences to decode (default: %d)", params.n_sequences });
     options.push_back({ "*",           "-cb,   --cont-batching",        "enable continuous batching (a.k.a dynamic batching) (default: %s)", params.cont_batching ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-nocb, --no-cont-batching",     "disable continuous batching" });
 
     options.push_back({ "multi-modality" });
-    options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file for LLaVA. see examples/llava/README.md" });
+    options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file. see examples/mtmd/README.md" });
     options.push_back({ "*",           "       --image FILE",           "path to an image file. use with multimodal models. Specify multiple times for batching" });
-
+    options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
+    options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
+    options.push_back({ "*",           "       --mtmd-kq-type TYPE",    "data type for multimodality K*Q (default: %s)", params.mtmd_kq_type.c_str() });
+    options.push_back({ "*",           "       --no-context-shift",     "disable context-shift." });
+    options.push_back({ "*",           "--context-shift (auto|on|off|0|1)", "set context-shift (default: %s)", params.ctx_shift ? "on" : "off" });
     options.push_back({ "backend" });
     options.push_back({ "*",           "       --rpc SERVERS",          "comma separated list of RPC servers" });
-
+    options.push_back({ "*",           "-cuda, --cuda-params",          "comma separate list of cuda parameters" });
+    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters" });
     if (llama_supports_mlock()) {
         options.push_back({ "*",           "       --mlock",                "force system to keep model in RAM rather than swapping or compressing" });
     }
     if (llama_supports_mmap()) {
         options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
     }
+    options.push_back({ "*",           "       --run-time-repack",      "repack tensors if interleaved variant is available"});
+    options.push_back({ "*",           "       --cpu-moe",              "keep all MoE weights in CPU memory"});
+    options.push_back({ "*",           "       --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
+    options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
+    options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
+    options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
+    options.push_back({ "*",           "       --fit",                  "automatically determine which tensors to offload to the GPU(s)"});
     options.push_back({ "*",           "       --numa TYPE",            "attempt optimizations that help on some NUMA systems\n"
                                                                         "  - distribute: spread execution evenly over all nodes\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
@@ -1892,12 +3260,19 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
         options.push_back({ "*",           "-sm,   --split-mode SPLIT_MODE",
                                                                         "how to split the model across multiple GPUs, one of:\n"
                                                                         "  - none: use one GPU only\n"
-                                                                        "  - layer (default): split layers and KV across GPUs\n"
-                                                                        "  - row: split rows across GPUs" });
+                                                                        "  - graph: split model tensors and computation graph across GPUs\n"
+                                                                        "  - layer (default): split layers and KV across GPUs\n" });
         options.push_back({ "*",           "-ts,   --tensor-split SPLIT",
                                                                         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1" });
+        options.push_back({ "*",           "-dev,   --device dev1,dev2",
+                                                                         "comma-separated list of devices to use for offloading (none = don't offload)\n"
+                                                                         "Example: CUDA0,CUDA1,RPC[192.168.0.1:8080]\n" });
+        options.push_back({ "*",           "-devd,   --device-draft dev1,dev2",
+                                                                         "comma-separated list of devices to use for offloading for the draft model (none = don't offload)\n"
+                                                                         "Example: CUDA0,CUDA1,RPC[192.168.0.1:8080]\n" });
         options.push_back({ "*",           "-mg,   --main-gpu i",       "the GPU to use for the model (with split-mode = none),\n"
                                                                         "or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu });
+        options.push_back({ "*",           "--max-gpu i",               "max. number of GPUs to use at a time with split mode 'graph', (default: %d)", params.max_gpu });
     }
 
     options.push_back({ "model" });
@@ -1905,12 +3280,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --override-kv KEY=TYPE:VALUE",
                                                                         "advanced option to override model metadata by key. may be specified multiple times.\n"
                                                                         "types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false" });
-    options.push_back({ "*",           "       --lora FNAME",           "apply LoRA adapter (implies --no-mmap)" });
-    options.push_back({ "*",           "       --lora-scaled FNAME S",  "apply LoRA adapter with user defined scaling S (implies --no-mmap)" });
-    options.push_back({ "*",           "       --lora-base FNAME",      "optional model to use as a base for the layers modified by the LoRA adapter" });
-    options.push_back({ "*",           "       --control-vector FNAME", "add a control vector" });
+    options.push_back({ "*",           "       --lora FNAME",           "apply LoRA adapter (can be repeated to use multiple adapters)" });
+    options.push_back({ "*",           "       --lora-scaled FNAME S",  "apply LoRA adapter with user defined scaling S (can be repeated to use multiple adapters)" });
+    options.push_back({ "*",           "       --control-vector FNAME", "add a control vector\n"
+                                                                        "note: this argument can be repeated to add multiple control vectors" });
     options.push_back({ "*",           "       --control-vector-scaled FNAME SCALE",
-                                                                        "add a control vector with user defined scaling SCALE" });
+                                                                        "add a control vector with user defined scaling SCALE\n"
+                                                                        "note: this argument can be repeated to add multiple scaled control vectors" });
     options.push_back({ "*",           "       --control-vector-layer-range START END",
                                                                         "layer range to apply the control vector(s) to, start and end inclusive" });
     options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --hf-file\n"
@@ -1919,6 +3295,23 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-mu,   --model-url MODEL_URL",  "model download url (default: unused)" });
     options.push_back({ "*",           "-hfr,  --hf-repo REPO",         "Hugging Face model repository (default: unused)" });
     options.push_back({ "*",           "-hff,  --hf-file FILE",         "Hugging Face model file (default: unused)" });
+    options.push_back({ "*",           "-hft,  --hf-token TOKEN",       "Hugging Face access token (default: value from HF_TOKEN environment variable)" });
+    options.push_back({ "*", "--recurrent-ckpt-mode MODE",    "checkpoint strategy for recurrent/hybrid speculative decoding\n"
+                                                              "  auto         auto-select: per-step if CUDA full-GPU, gpu-fallback otherwise (default)\n"
+                                                              "  per-step     save SSM state per draft step in VRAM; no re-decode on rejection\n"
+                                                              "  gpu-fallback copy state to GPU buffer; re-decode on rejection\n"
+                                                              "  cpu          serialise state via llama_state_seq; re-decode on rejection" });
+    options.push_back({ "*", "--spec-type SPEC[:k=v,...]",      "canonical speculative stage entry; repeat for a supported two-stage chain.\n"
+                                                              "types: none, draft, dflash, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
+                                                              "canonical keys: n_max,n_min,p_min,cross_ctx,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus\n"
+                                                              "for comma-bearing string values, quote the value inside the stage payload for normal shell use\n"
+                                                              "if argv is passed directly without shell unescaping, the parser also accepts escaped commas as \\,\n"
+                                                              "examples: --spec-type mtp:n_max=1,p_min=0.0\n"
+                                                              "          --model-draft draft.gguf --spec-type dflash:n_max=4,cross_ctx=512\n"
+                                                              "          --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n"
+                                                              "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
+                                                              "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });
+    options.push_back({ "*", "--spec-autotune",          "automatically tune speculative params to maximize tokens/sec" });
 
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });
@@ -1932,6 +3325,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
 
     options.push_back({ "imatrix" });
     options.push_back({ "imatrix",     "-o,    --output FNAME",         "output file (default: '%s')", params.out_file.c_str() });
+    options.push_back({ "imatrix",     "       --output-draft FNAME",   "paired draft output file (default: derived from --output)" });
     options.push_back({ "imatrix",     "       --output-frequency N",   "output the imatrix every N iterations (default: %d)", params.n_out_freq });
     options.push_back({ "imatrix",     "       --save-frequency N",     "save an imatrix copy every N iterations (default: %d)", params.n_save_freq });
     options.push_back({ "imatrix",     "       --process-output",       "collect data for the output tensor (default: %s)", params.process_output ? "true" : "false" });
@@ -1944,11 +3338,23 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "bench",       "-ntg n0,n1,...",                "number of text generation tokens" });
     options.push_back({ "bench",       "-npl n0,n1,...",                "number of parallel prompts" });
 
+    options.push_back({ "embedding" });
+    options.push_back({ "embedding",   "       --embd-normalize",       "normalisation for embendings (default: %d) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)", params.embd_normalize });
+    options.push_back({ "embedding",   "       --embd-output-format",   "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix" });
+    options.push_back({ "embedding",   "       --embd-separator",       "separator of embendings (default \\n) for example \"<#sep#>\"" });
+
     options.push_back({ "server" });
     options.push_back({ "server",      "       --host HOST",            "ip address to listen (default: %s)", params.hostname.c_str() });
     options.push_back({ "server",      "       --port PORT",            "port to listen (default: %d)", params.port });
     options.push_back({ "server",      "       --path PATH",            "path to serve static files from (default: %s)", params.public_path.c_str() });
-    options.push_back({ "server",      "       --embedding(s)",         "enable embedding endpoint (default: %s)", params.embedding ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --embedding(s)",         "restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled" });
+    options.push_back({ "server",        "       --webui NAME",
+                                                             "controls which webui to server:\n"
+                                                            "- none: disable webui\n"
+                                                            "- auto: default webui \n"
+                                                            "- llamacpp: llamacpp webui \n"
+                                                            "(default: auto)", });
+    options.push_back({ "server",      "       --ui-mcp-proxy, --webui-mcp-proxy",          "experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)" });
     options.push_back({ "server",      "       --api-key KEY",          "API key to use for authentication (default: none)" });
     options.push_back({ "server",      "       --api-key-file FNAME",   "path to file containing API keys (default: none)" });
     options.push_back({ "server",      "       --ssl-key-file FNAME",   "path to file a PEM-encoded SSL private key" });
@@ -1968,6 +3374,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template" });
     options.push_back({ "server",      "-sps,  --slot-prompt-similarity SIMILARITY",
                                                                         "how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity });
+    options.push_back({ "server",      "       --lora-init-without-apply",     "load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"});
 
 #ifndef LOG_DISABLE_LOGS
     options.push_back({ "logging" });
@@ -1986,11 +3393,16 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "cvector",     "-o,    --output FNAME",         "output file (default: '%s')", params.cvector_outfile.c_str() });
     options.push_back({ "cvector",     "       --positive-file FNAME",  "positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str() });
     options.push_back({ "cvector",     "       --negative-file FNAME",  "negative prompts file, one prompt per line (default: '%s')", params.cvector_negative_file.c_str() });
-    options.push_back({ "cvector",     "       --completions-file FNAME",
-                                                                        "completions file (default: '%s')", params.cvector_completions_file.c_str() });
-    options.push_back({ "cvector",     "       --completions N",        "number of lines of completions file to use (default: %d)", params.n_completions });
-    options.push_back({ "cvector",     "       --batch-pca N",          "batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch });
-    options.push_back({ "cvector",     "       --iter-pca N",           "number of iterations used for PCA (default: %d)", params.n_pca_iterations });
+    options.push_back({ "cvector",     "       --pca-batch N",          "batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch });
+    options.push_back({ "cvector",     "       --pca-iter N",           "number of iterations used for PCA (default: %d)", params.n_pca_iterations });
+    options.push_back({ "cvector",     "       --method {pca,mean}",    "dimensionality reduction method to be used (default: pca)" });
+
+    options.push_back({ "export-lora" });
+    options.push_back({ "export-lora", "-m,    --model",                "model path from which to load base model (default '%s')", params.model.c_str() });
+    options.push_back({ "export-lora", "       --lora FNAME",           "path to LoRA adapter  (can be repeated to use multiple adapters)" });
+    options.push_back({ "export-lora", "       --lora-scaled FNAME S",  "path to LoRA adapter with user defined scaling S  (can be repeated to use multiple adapters)" });
+    options.push_back({ "*",           "-t,    --threads N",            "number of threads to use during computation (default: %d)", params.n_threads });
+    options.push_back({ "export-lora", "-o,    --output FNAME",         "output file (default: '%s')", params.lora_outfile.c_str() });
 
     printf("usage: %s [options]\n", argv[0]);
 
@@ -2025,6 +3437,9 @@ std::string gpt_params_get_system_info(const gpt_params & params) {
     if (params.n_threads_batch != -1) {
         os << " (n_threads_batch = " << params.n_threads_batch << ")";
     }
+    if (params.n_threads_mtmd != -1) {
+        os << " (n_threads_mtmd = " << params.n_threads_mtmd << ")";
+    }
     os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
 
     return os.str();
@@ -2034,26 +3449,96 @@ std::string gpt_params_get_system_info(const gpt_params & params) {
 // String utils
 //
 
-std::vector<std::string> string_split(std::string input, char separator) {
-    std::vector<std::string> parts;
-    size_t separator_pos = input.find(separator);
-    while (separator_pos != std::string::npos) {
-        std::string part = input.substr(0, separator_pos);
-        parts.emplace_back(part);
-        input = input.substr(separator_pos + 1);
-        separator_pos = input.find(separator);
+std::string string_format(const char* fmt, ...) {
+    va_list ap;
+    va_list ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int size = vsnprintf(NULL, 0, fmt, ap);
+    GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
+    std::vector<char> buf(size + 1);
+    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    GGML_ASSERT(size2 == size);
+    va_end(ap2);
+    va_end(ap);
+    return std::string(buf.data(), size);
+}
+
+std::string regex_escape(const std::string& s) {
+    static const std::regex special_chars("[.^$|()*+?\\[\\]{}\\\\]");
+    return std::regex_replace(s, special_chars, "\\$0");
+}
+
+std::string string_join(const std::vector<std::string>& values, const std::string& separator) {
+    std::ostringstream result;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            result << separator;
+        }
+        result << values[i];
     }
-    parts.emplace_back(input);
+    return result.str();
+}
+
+
+std::vector<std::string> string_split(const std::string& str, const std::string& delimiter) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    size_t end = str.find(delimiter);
+
+    while (end != std::string::npos) {
+        parts.push_back(str.substr(start, end - start));
+        start = end + delimiter.length();
+        end = str.find(delimiter, start);
+    }
+
+    parts.push_back(str.substr(start));
+
     return parts;
+}
+
+std::vector<std::string> string_split(const std::string& str, char delim) {
+    std::vector<std::string> values;
+    std::istringstream str_stream(str);
+    std::string token;
+    while (std::getline(str_stream, token, delim)) {
+        std::string value;
+        std::istringstream token_stream(token);
+        token_stream >> value;
+        values.push_back(value);
+    }
+    return values;
+}
+
+std::string string_repeat(const std::string & str, size_t n) {
+    if (n == 0) {
+        return "";
+    }
+
+    std::string result;
+    result.reserve(str.length() * n);
+
+    for (size_t i = 0; i < n; ++i) {
+        result += str;
+    }
+
+    return result;
+}
+
+static bool is_utf8_whitespace(uint8_t c) {
+    // Basic ASCII whitespace
+    if (c <= 0x7F) return isspace(c);
+    // Else: Not whitespace (or you'd need a full Unicode table)
+    return false;
 }
 
 std::string string_strip(const std::string & str) {
     size_t start = 0;
     size_t end = str.size();
-    while (start < end && std::isspace(str[start])) {
+    while (start < end && is_utf8_whitespace(str[start])) {
         start++;
     }
-    while (end > start && std::isspace(str[end - 1])) {
+    while (end > start && is_utf8_whitespace(str[end - 1])) {
         end--;
     }
     return str.substr(start, end - start);
@@ -2073,6 +3558,48 @@ std::string string_get_sortable_timestamp() {
     snprintf(timestamp_ns, 11, "%09" PRId64, ns);
 
     return std::string(timestamp_no_ns) + "." + std::string(timestamp_ns);
+}
+
+// could be improved to support more languages
+std::string string_lower(const std::string& str) {
+    std::string result = str;
+    for (char& c : result) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c + ('a' - 'A'));
+        }
+    }
+    return result;
+}
+
+
+void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {
+    if (search.empty()) {
+        return; // Avoid infinite loop if 'search' is an empty string
+    }
+    size_t pos = 0;
+    while ((pos = s.find(search, pos)) != std::string::npos) {
+        s.replace(pos, search.length(), replace);
+        pos += replace.length();
+    }
+}
+
+bool string_ends_with(const std::string_view& str, const std::string_view& suffix) {
+    return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+size_t string_find_partial_stop(const std::string_view& str, const std::string_view& stop) {
+    if (!str.empty() && !stop.empty()) {
+        const char text_last_char = str.back();
+        for (int64_t char_index = stop.size() - 1; char_index >= 0; char_index--) {
+            if (stop[char_index] == text_last_char) {
+                const auto current_partial = stop.substr(0, char_index + 1);
+                if (string_ends_with(str, current_partial)) {
+                    return str.size() - char_index - 1;
+                }
+            }
+        }
+    }
+
+    return std::string::npos;
 }
 
 void string_process_escapes(std::string & input) {
@@ -2110,6 +3637,28 @@ void string_process_escapes(std::string & input) {
     }
 
     input.resize(output_idx);
+}
+
+std::string string_unescape(const std::string& str) {
+    std::string result;
+    result.reserve(2 * str.length());
+    for (const auto c: str) {
+        switch (c) {
+        case '\n':
+            result.append("\\n");
+            break;
+        case '\t':
+            result.append("\\t");
+            break;
+        case '\r':
+            result.append("\\r");
+            break;
+        default:
+            result.append(1, c);
+            break;
+        }
+    }
+    return result;
 }
 
 bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_override> & overrides) {
@@ -2158,6 +3707,42 @@ bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_over
     return true;
 }
 
+std::vector<std::string> string_extract(const std::string& str, const char c, std::vector<size_t>& posi) {
+    std::vector<std::string> extracts;
+    auto pos = str.find(c);
+    size_t count = 0;
+    while (pos != std::string::npos) {
+        if (count % 2 == 0) {
+            // opening c
+            posi.push_back(pos);
+            ++count;
+        } else {
+            // closing c must be unescaped
+            auto esc_pos = pos;
+            size_t n_esc = 0;
+            while ((esc_pos > 0) && (str[--esc_pos] == '\\')) {
+                ++n_esc;
+            }
+            if (n_esc % 2 == 0) {
+                extracts.push_back(str.substr(posi.back() + 1, pos - posi.back() - 1));
+                string_process_escapes(extracts.back());
+                posi.push_back(pos);
+                ++count;
+            }
+        }
+        pos = str.find(c, pos + 1);
+    }
+    return extracts;
+}
+
+bool string_is_found(const std::string& window, const std::string& str, size_t& pos) {
+    if (str.empty()) {
+        return false;
+    }
+    pos = window.find(str);
+    return pos != std::string::npos;
+}
+
 //
 // Filesystem utils
 //
@@ -2178,7 +3763,19 @@ bool fs_validate_filename(const std::string & filename) {
 
     std::u32string filename_utf32;
     try {
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
         std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#endif
         filename_utf32 = converter.from_bytes(filename);
 
         // If the reverse conversion mismatches, it means overlong UTF-8 sequences were used,
@@ -2233,11 +3830,29 @@ bool fs_validate_filename(const std::string & filename) {
     return true;
 }
 
+#ifdef _WIN32
+static std::wstring utf8_to_wstring(const std::string& str) {
+    if (str.empty()) {
+        return std::wstring();
+    }
+
+    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+
+    if (size <= 0) {
+        return std::wstring();
+    }
+
+    std::wstring wstr(size, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size);
+
+    return wstr;
+}
+#endif
+
 // returns true if successful, false otherwise
 bool fs_create_directory_with_parents(const std::string & path) {
 #ifdef _WIN32
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    std::wstring wpath = converter.from_bytes(path);
+    std::wstring wpath = utf8_to_wstring(path);
 
     // if the path already exists, check whether it's a directory
     const DWORD attributes = GetFileAttributesW(wpath.c_str());
@@ -2345,35 +3960,37 @@ std::string fs_get_cache_file(const std::string & filename) {
 }
 
 
-//
-// Model utils
-//
+struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
+    llama_init_result iparams;
 
-std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params(gpt_params & params) {
-    auto mparams = llama_model_params_from_gpt_params(params);
+    auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = nullptr;
 
     if (!params.hf_repo.empty() && !params.hf_file.empty()) {
-        model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), mparams);
+        model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
     } else if (!params.model_url.empty()) {
-        model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), mparams);
+        model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
     } else {
-        model = llama_load_model_from_file(params.model.c_str(), mparams);
+        model = llama_model_load_from_file(params.model.c_str(), mparams);
     }
 
     if (model == NULL) {
         fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
-        return std::make_tuple(nullptr, nullptr);
+        return iparams;
     }
 
-    auto cparams = llama_context_params_from_gpt_params(params);
+    auto cparams = common_context_params_to_llama(params);
 
-    llama_context * lctx = llama_new_context_with_model(model, cparams);
+    llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, params.model.c_str());
         llama_free_model(model);
-        return std::make_tuple(nullptr, nullptr);
+        return iparams;
+    }
+
+    for (auto [op, on_off] : params.offload_policy) {
+        llama_set_offload_policy(lctx, op, on_off);
     }
 
     if (!params.control_vectors.empty()) {
@@ -2384,7 +4001,7 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
         if (cvec.n_embd == -1) {
             llama_free(lctx);
             llama_free_model(model);
-            return std::make_tuple(nullptr, nullptr);
+            return iparams;
         }
 
         int err = llama_control_vector_apply(lctx,
@@ -2396,66 +4013,80 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
         if (err) {
             llama_free(lctx);
             llama_free_model(model);
-            return std::make_tuple(nullptr, nullptr);
+            return iparams;
         }
     }
 
-    for (unsigned int i = 0; i < params.lora_adapter.size(); ++i) {
-        const std::string & lora_adapter = std::get<0>(params.lora_adapter[i]);
-        float lora_scale = std::get<1>(params.lora_adapter[i]);
-        int err = llama_model_apply_lora_from_file(model,
-                                             lora_adapter.c_str(),
-                                             lora_scale,
-                                             ((i > 0) || params.lora_base.empty())
-                                                ? NULL
-                                                : params.lora_base.c_str(),
-                                             params.n_threads);
-        if (err != 0) {
-            fprintf(stderr, "%s: error: failed to apply lora adapter\n", __func__);
+    // load and optionally apply lora adapters
+    for (auto & la : params.lora_adapters) {
+        llama_lora_adapter_container loaded_la;
+        loaded_la.path = la.path;
+        loaded_la.scale = la.scale;
+        loaded_la.adapter = llama_lora_adapter_init(model, la.path.c_str());
+        if (loaded_la.adapter == nullptr) {
+            fprintf(stderr, "%s: error: failed to apply lora adapter '%s'\n", __func__, la.path.c_str());
             llama_free(lctx);
             llama_free_model(model);
-            return std::make_tuple(nullptr, nullptr);
+            return iparams;
         }
+        iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
+    }
+    if (!params.lora_init_without_apply) {
+        llama_lora_adapters_apply(lctx, iparams.lora_adapters);
     }
 
     if (params.ignore_eos) {
         params.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
     }
 
+    if (params.sparams.dry_penalty_last_n == -1) {
+        LOG("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+        params.sparams.dry_penalty_last_n = llama_n_ctx(lctx);
+    }
+
     if (params.warmup) {
         LOG("warming up the model with an empty run\n");
 
-        std::vector<llama_token> tmp = { llama_token_bos(model), llama_token_eos(model), };
-        llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch), 0, 0));
+        std::vector<llama_token> tmp;
+        llama_token bos = llama_token_bos(model);
+        llama_token eos = llama_token_eos(model);
+        // some models (e.g. T5) don't have a BOS token
+        if (bos != -1) {
+            tmp.push_back(bos);
+        }
+	else
+	{
+	    tmp.push_back(eos);
+	}
+        if (llama_model_has_encoder(model)) {
+            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size(), 0, 0));
+            llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+            if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+                decoder_start_token_id = bos;
+            }
+            tmp.clear();
+            tmp.push_back(decoder_start_token_id);
+        }
+        if (llama_model_has_decoder(model)) {
+            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch), 0, 0));
+        }
         llama_kv_cache_clear(lctx);
         llama_synchronize(lctx);
         llama_reset_timings(lctx);
     }
 
-    return std::make_tuple(model, lctx);
+    iparams.model   = model;
+    iparams.context = lctx;
+    return iparams;
 }
 
-struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & params) {
-    auto mparams = llama_model_default_params();
-
-    if (params.n_gpu_layers != -1) {
-        mparams.n_gpu_layers = params.n_gpu_layers;
+void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lora_adapter_container> & lora_adapters) {
+    llama_lora_adapter_clear(ctx);
+    for (auto & la : lora_adapters) {
+        if (la.scale != 0.0f) {
+            llama_lora_adapter_set(ctx, la.adapter, la.scale);
+        }
     }
-    mparams.rpc_servers     = params.rpc_servers.c_str();
-    mparams.main_gpu        = params.main_gpu;
-    mparams.split_mode      = params.split_mode;
-    mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_mlock       = params.use_mlock;
-    mparams.check_tensors   = params.check_tensors;
-    if (params.kv_overrides.empty()) {
-        mparams.kv_overrides = NULL;
-    } else {
-        GGML_ASSERT(params.kv_overrides.back().key[0] == 0 && "KV overrides not terminated with empty key");
-        mparams.kv_overrides = params.kv_overrides.data();
-    }
-
-    return mparams;
 }
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2464,6 +4095,9 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     }
     if (s == "f16") {
         return GGML_TYPE_F16;
+    }
+    if (s == "bf16") {
+        return GGML_TYPE_BF16;
     }
     if (s == "q8_0") {
         return GGML_TYPE_Q8_0;
@@ -2483,22 +4117,139 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     if (s == "q5_1") {
         return GGML_TYPE_Q5_1;
     }
+    if (s == "q6_0") {
+        return GGML_TYPE_Q6_0;
+    }
+    if (s == "q8_KV") {
+        return GGML_TYPE_Q8_KV;
+    }
 
     throw std::runtime_error("Invalid cache type: " + s);
 }
 
-struct llama_context_params llama_context_params_from_gpt_params(const gpt_params & params) {
+static std::pair<int, int> get_batch_ubatch(const gpt_params & params) {
+    int n_batch = params.n_batch;
+    int n_ubatch = params.n_ubatch;
+    if (params.n_ctx > 0) {
+        n_batch = std::min(n_batch, params.n_ctx);
+    }
+    n_ubatch = std::min(n_batch, n_ubatch);
+    return {n_batch, n_ubatch};
+}
+
+static ggml_type parse_ggml_type(const char * arg) {
+    for (int j = 0; j < GGML_TYPE_COUNT; ++j) {
+        auto type = ggml_type(j);
+        const auto * name = ggml_type_name(type);
+        if (name && strcmp(arg, name) == 0) {
+            return type;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
+struct llama_model_params common_model_params_to_llama(const gpt_params & params) {
+    auto mparams = llama_model_default_params();
+    mparams.devices = params.devices.c_str();
+
+    if (params.n_gpu_layers != -1) {
+        mparams.n_gpu_layers = params.n_gpu_layers;
+    }
+    mparams.mla             = params.mla_attn;
+    mparams.dry_run         = params.dry_run;
+    mparams.rpc_servers     = params.rpc_servers.c_str();
+    mparams.main_gpu        = params.main_gpu;
+    mparams.max_gpu         = params.max_gpu;
+    mparams.ncmoe           = params.ncmoe;
+    mparams.fit             = params.fit;
+    mparams.fit_margin      = params.fit_margin;
+    mparams.worst_graph_tokens = params.worst_graph_tokens;
+    mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
+    mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
+    mparams.idx_type_k      = kv_cache_type_from_str(params.indexer_cache_type_k);
+    mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
+    mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
+    mparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
+    mparams.type_v_last     = kv_cache_type_from_str(params.type_v_last );
+    if (!params.extra_output_type.empty()) {
+        mparams.extra_output_type = parse_ggml_type(params.extra_output_type.c_str());
+    }
+    mparams.n_k_first       = params.n_k_first;
+    mparams.n_k_last        = params.n_k_last;
+    mparams.n_v_first       = params.n_v_first;
+    mparams.n_v_last        = params.n_v_last;
+    mparams.max_ctx_size    = params.n_ctx;
+    mparams.n_seq_max       = params.n_parallel;
+    mparams.n_ubatch        = get_batch_ubatch(params).second;
+    mparams.amb             = params.attn_max_batch;
+    mparams.split_mode      = params.split_mode;
+    mparams.tensor_split    = params.tensor_split;
+    mparams.use_mmap        = params.use_mmap;
+    mparams.use_mlock       = params.use_mlock;
+    mparams.check_tensors   = params.check_tensors;
+    mparams.repack_tensors  = params.repack_tensors;
+    mparams.use_thp         = params.use_thp;
+    mparams.validate_quants = params.validate_quants;
+    mparams.merge_qkv       = params.merge_qkv;
+    mparams.merge_up_gate_exps = params.merge_up_gate_exps;
+    mparams.mtp             = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+    mparams.flash_attn      = params.flash_attn;
+    mparams.defer_experts   = params.defer_experts;
+    if (params.kv_overrides.empty()) {
+        mparams.kv_overrides = NULL;
+    } else {
+        GGML_ASSERT(params.kv_overrides.back().key[0] == 0 && "KV overrides not terminated with empty key");
+        mparams.kv_overrides = params.kv_overrides.data();
+    }
+    if (params.tensor_buft_overrides.empty()) {
+        mparams.tensor_buft_overrides = NULL;
+    } else {
+        GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
+        mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    }
+    if (!mparams.flash_attn && ggml_is_quantized(mparams.type_v)) {
+        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
+    }
+    if (!params.fit_margin_array.empty()) {
+        GGML_ASSERT(params.fit_margin_array.size() % 2 == 0 && "Fit margin array does not have even number of elements");
+        GGML_ASSERT(params.fit_margin_array[params.fit_margin_array.size()-2] == -1 && "Fit margin array is not correctly termionated");
+        mparams.fit_margin_array = params.fit_margin_array.data();
+    }
+
+    return mparams;
+}
+
+static ggml_type ggml_type_from_str(const std::string & s) {
+    if (s == "f32") {
+        return GGML_TYPE_F32;
+    }
+    if (s == "f16") {
+        return GGML_TYPE_F16;
+    }
+    if (s == "bf16") {
+        return GGML_TYPE_BF16;
+    }
+    if (s == "q8_0") {
+        return GGML_TYPE_Q8_0;
+    }
+    throw std::runtime_error("Invalid graph reduce type: " + s);
+}
+
+struct llama_context_params common_context_params_to_llama(const gpt_params & params) {
     auto cparams = llama_context_default_params();
+
+    auto [n_batch, n_ubatch] = get_batch_ubatch(params);
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_batch           = params.n_batch;
-    cparams.n_ubatch          = params.n_ubatch;
+    cparams.n_batch           = n_batch;
+    cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;
     cparams.n_threads_batch   = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
     cparams.seed              = params.seed;
     cparams.logits_all        = params.logits_all;
     cparams.embeddings        = params.embedding;
+    cparams.worst_case_tokens = params.worst_graph_tokens;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;
     cparams.rope_freq_scale   = params.rope_freq_scale;
@@ -2508,14 +4259,59 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.yarn_beta_slow    = params.yarn_beta_slow;
     cparams.yarn_orig_ctx     = params.yarn_orig_ctx;
     cparams.pooling_type      = params.pooling_type;
+    cparams.attention_type    = params.attention_type;
     cparams.defrag_thold      = params.defrag_thold;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
+    cparams.mla_attn          = params.mla_attn;
+    cparams.attn_max_batch    = params.attn_max_batch;
+    cparams.fused_moe_up_gate = params.fused_moe_up_gate;
+    cparams.grouped_expert_routing = params.grouped_expert_routing;
+    cparams.fused_up_gate     = params.fused_up_gate;
+    cparams.fused_mmad        = params.fused_mmad;
+    cparams.rope_cache        = params.rope_cache;
+    cparams.graph_reuse       = params.graph_reuse;
+    cparams.dsa               = params.dsa;
+    cparams.dsa_top_k         = params.dsa_top_k;
+    cparams.k_cache_hadamard  = params.k_cache_hadamard;
+    cparams.v_cache_hadamard  = params.v_cache_hadamard;
+    cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
+    //cparams.split_mode_f16    = params.split_mode_f16;
+    cparams.scheduler_async   = params.scheduler_async;
+    cparams.min_experts       = params.min_experts;
+    cparams.thresh_experts    = params.thresh_experts;
+    cparams.only_active_experts = params.only_active_exps;
+    cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
+    cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+    cparams.mtp_op_type      = MTP_OP_NONE;
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
+    cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k);
+    cparams.type_reduce = ggml_type_from_str(params.reduce_type);
+    cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
+    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v)) {
+        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
+    }
+    cparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
+    cparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
+    cparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
+    cparams.type_v_last     = kv_cache_type_from_str(params.type_v_last );
+    cparams.n_k_first       = params.n_k_first;
+    cparams.n_k_last        = params.n_k_last;
+    cparams.n_v_first       = params.n_v_first;
+    cparams.n_v_last        = params.n_v_last;
+    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_first) && cparams.n_v_first > 0) {
+        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
+    }
+    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_last) && cparams.n_v_last > 0) {
+        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
+    }
+
+    if (!params.offload_policy.empty()) cparams.offload_policy = (void *)&params.offload_policy;
+    if (!params.cuda_params.empty()) cparams.cuda_params = (void *)params.cuda_params.data();
 
     return cparams;
 }
@@ -2527,7 +4323,7 @@ static bool starts_with(const std::string & str, const std::string & prefix) {
     return str.rfind(prefix, 0) == 0;
 }
 
-static bool llama_download_file(const std::string & url, const std::string & path) {
+static bool llama_download_file(const std::string & url, const std::string & path, const std::string & hf_token) {
 
     // Initialize libcurl
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
@@ -2541,6 +4337,15 @@ static bool llama_download_file(const std::string & url, const std::string & pat
     // Set the URL, allow to follow http redirection
     curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+
+    // Check if hf-token or bearer-token was specified
+    if (!hf_token.empty()) {
+      std::string auth_header = "Authorization: Bearer ";
+      auth_header += hf_token.c_str();
+      struct curl_slist *http_headers = NULL;
+      http_headers = curl_slist_append(http_headers, auth_header.c_str());
+      curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers);
+    }
 
 #if defined(_WIN32)
     // CURLSSLOPT_NATIVE_CA tells libcurl to use standard certificate store of
@@ -2737,6 +4542,7 @@ static bool llama_download_file(const std::string & url, const std::string & pat
 struct llama_model * llama_load_model_from_url(
         const char * model_url,
         const char * path_model,
+        const char * hf_token,
         const struct llama_model_params & params) {
     // Basic validation of the model_url
     if (!model_url || strlen(model_url) == 0) {
@@ -2744,7 +4550,7 @@ struct llama_model * llama_load_model_from_url(
         return NULL;
     }
 
-    if (!llama_download_file(model_url, path_model)) {
+    if (!llama_download_file(model_url, path_model, hf_token)) {
         return NULL;
     }
 
@@ -2792,14 +4598,14 @@ struct llama_model * llama_load_model_from_url(
         // Prepare download in parallel
         std::vector<std::future<bool>> futures_download;
         for (int idx = 1; idx < n_split; idx++) {
-            futures_download.push_back(std::async(std::launch::async, [&split_prefix, &split_url_prefix, &n_split](int download_idx) -> bool {
+            futures_download.push_back(std::async(std::launch::async, [&split_prefix, &split_url_prefix, &n_split, hf_token](int download_idx) -> bool {
                 char split_path[PATH_MAX] = {0};
                 llama_split_path(split_path, sizeof(split_path), split_prefix, download_idx, n_split);
 
                 char split_url[LLAMA_CURL_MAX_URL_LENGTH] = {0};
                 llama_split_path(split_url, sizeof(split_url), split_url_prefix, download_idx, n_split);
 
-                return llama_download_file(split_url, split_path);
+                return llama_download_file(split_url, split_path, hf_token);
             }, idx));
         }
 
@@ -2811,13 +4617,14 @@ struct llama_model * llama_load_model_from_url(
         }
     }
 
-    return llama_load_model_from_file(path_model, params);
+    return llama_model_load_from_file(path_model, params);
 }
 
 struct llama_model * llama_load_model_from_hf(
         const char * repo,
         const char * model,
         const char * path_model,
+        const char * hf_token,
         const struct llama_model_params & params) {
     // construct hugging face model url:
     //
@@ -2833,7 +4640,7 @@ struct llama_model * llama_load_model_from_hf(
     model_url += "/resolve/main/";
     model_url += model;
 
-    return llama_load_model_from_url(model_url.c_str(), path_model, params);
+    return llama_load_model_from_url(model_url.c_str(), path_model, hf_token, params);
 }
 
 #else
@@ -2841,6 +4648,7 @@ struct llama_model * llama_load_model_from_hf(
 struct llama_model * llama_load_model_from_url(
         const char * /*model_url*/,
         const char * /*path_model*/,
+        const char * /*hf_token*/,
         const struct llama_model_params & /*params*/) {
     fprintf(stderr, "%s: llama.cpp built without libcurl, downloading from an url not supported.\n", __func__);
     return nullptr;
@@ -2850,6 +4658,7 @@ struct llama_model * llama_load_model_from_hf(
         const char * /*repo*/,
         const char * /*model*/,
         const char * /*path_model*/,
+        const char * /*hf_token*/,
         const struct llama_model_params & /*params*/) {
     fprintf(stderr, "%s: llama.cpp built without libcurl, downloading from Hugging Face not supported.\n", __func__);
     return nullptr;
@@ -2861,16 +4670,17 @@ struct llama_model * llama_load_model_from_hf(
 // Batch utils
 //
 
-void llama_batch_clear(struct llama_batch & batch) {
+void common_batch_clear(struct llama_batch & batch) {
     batch.n_tokens = 0;
 }
 
-void llama_batch_add(
+void common_batch_add(
                  struct llama_batch & batch,
                         llama_token   id,
                           llama_pos   pos,
     const std::vector<llama_seq_id> & seq_ids,
                                bool   logits) {
+    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
     batch.token   [batch.n_tokens] = id;
     batch.pos     [batch.n_tokens] = pos;
     batch.n_seq_id[batch.n_tokens] = seq_ids.size();
@@ -2886,15 +4696,15 @@ void llama_batch_add(
 // Vocab utils
 //
 
-std::vector<llama_token> llama_tokenize(
+std::vector<llama_token> common_tokenize(
   const struct llama_context * ctx,
            const std::string & text,
                         bool   add_special,
                         bool   parse_special) {
-    return llama_tokenize(llama_get_model(ctx), text, add_special, parse_special);
+    return common_tokenize(llama_get_model(ctx), text, add_special, parse_special);
 }
 
-std::vector<llama_token> llama_tokenize(
+std::vector<llama_token> common_tokenize(
     const struct llama_model * model,
            const std::string & text,
                         bool   add_special,
@@ -2913,65 +4723,113 @@ std::vector<llama_token> llama_tokenize(
     return result;
 }
 
-std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
-    std::vector<char> result(8, 0);
-    const int n_tokens = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size(), special);
+std::vector<llama_token> llama_tokenize(
+    const struct llama_vocab* vocab,
+    const std::string& text,
+    bool   add_special,
+    bool   parse_special) {
+    // upper limit for the number of tokens
+    int n_tokens = text.length() + 2 * add_special;
+    std::vector<llama_token> result(n_tokens);
+    n_tokens = llama_vocab_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+    if (n_tokens == std::numeric_limits<int32_t>::min()) {
+        throw std::runtime_error("Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
+    }
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size(), special);
+        int check = llama_vocab_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
         GGML_ASSERT(check == -n_tokens);
-    } else {
+    }
+    else {
         result.resize(n_tokens);
     }
-
-    return std::string(result.data(), result.size());
-}
-
-std::string llama_detokenize_spm(llama_context * ctx, const std::vector<llama_token> & tokens) {
-    const llama_token bos_id = llama_token_bos(llama_get_model(ctx));
-
-    std::string piece;
-    std::string result;
-
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        piece = llama_token_to_piece(ctx, tokens[i]);
-
-        // remove the leading space of the first non-BOS token
-        if (((tokens[0] == bos_id && i == 1) || (tokens[0] != bos_id && i == 0)) && piece[0] == ' ') {
-            piece = piece.substr(1);
-        }
-
-        result += piece;
-    }
-
     return result;
 }
 
-std::string llama_detokenize_bpe(llama_context * ctx, const std::vector<llama_token> & tokens) {
+std::vector<llama_token> common_tokenize(
+    const struct llama_vocab * vocab,
+    const std::string & text,
+    bool   add_special,
+    bool   parse_special){
+
+    return llama_tokenize(vocab, text, add_special, parse_special);
+}
+
+std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
     std::string piece;
-    std::string result;
-
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        piece = llama_token_to_piece(ctx, tokens[i]);
-
-        result += piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece(llama_get_model(ctx), token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(llama_get_model(ctx), token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
     }
+    else {
+        piece.resize(n_chars);
+    }
+
+    return piece;
+}
+
+std::string llama_token_to_piece(const struct llama_model* model, llama_token token, bool special) {
+    std::string piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece(model, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(model, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    }
+    else {
+        piece.resize(n_chars);
+    }
+
+    return piece;
+}
+
+std::string common_detokenize(const struct llama_context * ctx, const std::vector<llama_token> & tokens, bool special) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    return common_detokenize(vocab, tokens, special);
+}
+
+std::string common_detokenize(const struct llama_vocab * vocab, const std::vector<llama_token> & tokens, bool special) {
+    std::string text;
+    text.resize(std::max(text.capacity(), tokens.size()));
+    int32_t n_chars = llama_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
+    if (n_chars < 0) {
+        text.resize(-n_chars);
+        n_chars = llama_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
+        GGML_ASSERT(n_chars <= (int32_t)text.size());  // whitespace trimming is performed after per-token detokenization
+    }
+
+    text.resize(n_chars);
 
     // NOTE: the original tokenizer decodes bytes after collecting the pieces.
-    return result;
+    return text;
+}
+
+std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
+    std::string piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece_vocab(vocab, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece_vocab(vocab, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    } else {
+        piece.resize(n_chars);
+    }
+
+    return piece;
 }
 
 bool llama_should_add_bos_token(const llama_model * model) {
     const int add_bos = llama_add_bos_token(model);
-
-    return add_bos != -1 ? bool(add_bos) : (llama_vocab_type(model) == LLAMA_VOCAB_TYPE_SPM);
+    const llama_vocab * vocab = llama_get_model_vocab(model);
+    return add_bos != -1 ? bool(add_bos) : (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_SPM);
 }
 
-bool llama_chat_verify_template(const std::string & tmpl) {
-    llama_chat_message chat[] = {{"user", "test"}};
-    int res = llama_chat_apply_template(nullptr, tmpl.c_str(), chat, 1, true, nullptr, 0);
-    return res >= 0;
-}
 
 //
 // KV cache utils
@@ -3052,21 +4910,41 @@ void llama_kv_cache_dump_view_seqs(const llama_kv_cache_view & view, int row_siz
 // Embedding utils
 //
 
-void llama_embd_normalize(const float * inp, float * out, int n) {
+void common_embd_normalize(const float * inp, float * out, int n, int embd_norm) {
     double sum = 0.0;
-    for (int i = 0; i < n; i++) {
-        sum += inp[i] * inp[i];
-    }
-    sum = sqrt(sum);
 
-    const float norm = sum > 0.0 ? 1.0f / sum : 0.0f;
+    switch (embd_norm) {
+        case -1: // no normalisation
+            sum = 1.0;
+            break;
+        case 0: // max absolute
+            for (int i = 0; i < n; i++) {
+                if (sum < std::abs(inp[i])) sum = std::abs(inp[i]);
+            }
+            sum /= 32760.0; // make an int16 range
+            break;
+        case 2: // euclidean
+            for (int i = 0; i < n; i++) {
+                sum += inp[i] * inp[i];
+            }
+            sum = std::sqrt(sum);
+            break;
+        default: // p-norm (euclidean is p-norm p=2)
+            for (int i = 0; i < n; i++) {
+                sum += std::pow(std::abs(inp[i]), embd_norm);
+            }
+            sum = std::pow(sum, 1.0 / embd_norm);
+            break;
+    }
+
+    const float norm = sum > 0.0 ? 1.0 / sum : 0.0f;
 
     for (int i = 0; i < n; i++) {
         out[i] = inp[i] * norm;
     }
 }
 
-float llama_embd_similarity_cos(const float * embd1, const float * embd2, int n){
+float common_embd_similarity_cos(const float * embd1, const float * embd2, int n){
     double sum  = 0.0;
     double sum1 = 0.0;
     double sum2 = 0.0;
@@ -3077,6 +4955,14 @@ float llama_embd_similarity_cos(const float * embd1, const float * embd2, int n)
         sum2 += embd2[i] * embd2[i];
     }
 
+    // Handle the case where one or both vectors are zero vectors
+    if (sum1 == 0.0 || sum2 == 0.0) {
+        if (sum1 == 0.0 && sum2 == 0.0) {
+            return 1.0f; // two zero vectors are similar
+        }
+        return 0.0f;
+    }
+
     return sum / (sqrt(sum1) * sqrt(sum2));
 }
 
@@ -3085,124 +4971,86 @@ float llama_embd_similarity_cos(const float * embd1, const float * embd2, int n)
 //
 
 static llama_control_vector_data llama_control_vector_load_one(const llama_control_vector_load_info & load_info) {
-    int32_t n_tensors;
-
-    size_t n_bytes = 0;
-
-    uint32_t max_direction_layer = 0;
-
     llama_control_vector_data result = { -1, {} };
 
-    // calculate size of ctx needed for tensors, ensure tensors are f32, and find max layer
-    {
-        struct ggml_init_params meta_params = {
-            /* .mem_size   = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead(),
-            /* .mem_buffer = */ nullptr,
-            /* .no_alloc   = */ true,
-        };
-        ggml_context * meta_ctx = ggml_init(meta_params);
-        struct gguf_init_params meta_gguf_params = {
-            /* .no_alloc = */ true,
-            /* .ctx      = */ &meta_ctx,
-        };
-        struct gguf_context * meta_ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
-        if (!meta_ctx_gguf) {
-            fprintf(stderr, "%s: failed to load control vector from %s\n", __func__, load_info.fname.c_str());
-            ggml_free(meta_ctx);
-            return result;
-        }
-
-        n_tensors = gguf_get_n_tensors(meta_ctx_gguf);
-        for (int i = 0; i < n_tensors; i++) {
-            std::string name = gguf_get_tensor_name(meta_ctx_gguf, i);
-
-            // split on '.'
-            size_t dotpos = name.find('.');
-            if (dotpos != std::string::npos && name.substr(0, dotpos) == "direction") {
-                try {
-                    uint32_t layer = std::stoi(name.substr(dotpos + 1));
-                    if (layer == 0) {
-                        fprintf(stderr, "%s: direction tensor invalid in %s\n", __func__, load_info.fname.c_str());
-                        ggml_free(meta_ctx);
-                        gguf_free(meta_ctx_gguf);
-                        return result;
-                    }
-                    if (layer > max_direction_layer) {
-                        max_direction_layer = layer;
-                    }
-                } catch (...) {
-                    fprintf(stderr, "%s: direction tensor invalid in %s\n", __func__, load_info.fname.c_str());
-                    ggml_free(meta_ctx);
-                    gguf_free(meta_ctx_gguf);
-                    return result;
-                }
-            }
-
-            struct ggml_tensor * tensor_meta = ggml_get_tensor(meta_ctx, name.c_str());
-            if (tensor_meta->type != GGML_TYPE_F32 || ggml_n_dims(tensor_meta) != 1) {
-                fprintf(stderr, "%s: direction tensor invalid in %s\n", __func__, load_info.fname.c_str());
-                ggml_free(meta_ctx);
-                gguf_free(meta_ctx_gguf);
-                return result;
-            }
-            if (result.n_embd == -1) {
-                result.n_embd = ggml_nelements(tensor_meta);
-            } else if (ggml_nelements(tensor_meta) != result.n_embd) {
-                fprintf(stderr, "%s: direction tensor sizes mismatched in %s\n", __func__, load_info.fname.c_str());
-                ggml_free(meta_ctx);
-                gguf_free(meta_ctx_gguf);
-                return result;
-            }
-            n_bytes += ggml_nbytes(tensor_meta);
-        }
-        ggml_free(meta_ctx);
-        gguf_free(meta_ctx_gguf);
+    ggml_context * ctx = nullptr;
+    struct gguf_init_params meta_gguf_params = {
+        /* .no_alloc = */ false,
+        /* .ctx      = */ &ctx,
+    };
+    struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
+    if (!ctx_gguf) {
+        fprintf(stderr, "%s: failed to load control vector file from %s\n", __func__, load_info.fname.c_str());
+        return result;
     }
 
+    int32_t n_tensors = gguf_get_n_tensors(ctx_gguf);
     if (n_tensors == 0) {
         fprintf(stderr, "%s: no direction tensors found in %s\n", __func__, load_info.fname.c_str());
-        return result;
     }
 
-    // load and scale tensors into final control vector context
-    struct ggml_init_params ggml_params = {
-        /* .mem_size   = */ ggml_tensor_overhead() * n_tensors + n_bytes,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ false,
-    };
-    struct ggml_context * ctx = ggml_init(ggml_params);
+    for (int i = 0; i < n_tensors; i++) {
+        std::string name = gguf_get_tensor_name(ctx_gguf, i);
 
-    struct gguf_init_params params = {
-        /*.no_alloc = */ false,
-        /*.ctx      = */ &ctx,
-    };
-    struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), params);
-    if (!ctx_gguf) {
-        fprintf(stderr, "%s: failed to load control vector from %s\n", __func__, load_info.fname.c_str());
-        ggml_free(ctx);
-        return result;
-    }
+        int layer_idx = -1;
 
-    // do not store data for layer 0 (it's not used)
-    result.data.resize(result.n_embd * max_direction_layer);
-
-    for (uint32_t il = 1; il <= max_direction_layer; il++) {
-        const std::string name = "direction." + std::to_string(il);
-        const ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
-
-        float * dst = result.data.data() + result.n_embd * (il - 1);
-
-        if (tensor) {
-            const float * src = (const float *) tensor->data;
-            for (int j = 0; j < result.n_embd; j++) {
-                dst[j] = src[j] * load_info.strength;
-            }
-        } else {
-            for (int j = 0; j < result.n_embd; j++) {
-                dst[j] = 0.0f;
+        // split on '.'
+        size_t dotpos = name.find('.');
+        if (dotpos != std::string::npos && name.substr(0, dotpos) == "direction") {
+            try {
+                layer_idx = std::stoi(name.substr(dotpos + 1));
+            } catch (...) {
+                layer_idx = -1;
             }
         }
+        if (layer_idx < 0) {
+            fprintf(stderr, "%s: invalid/unparsable direction tensor layer index in %s\n", __func__, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
+        } else if (layer_idx == 0) {
+            fprintf(stderr, "%s: invalid (zero) direction tensor layer index in %s\n", __func__, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
+        }
+
+        struct ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
+        if (tensor->type != GGML_TYPE_F32) {
+            fprintf(stderr, "%s: invalid (non-F32) direction tensor type in %s\n", __func__, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
+        }
+        if (ggml_n_dims(tensor) != 1) {
+            fprintf(stderr, "%s: invalid (non-1D) direction tensor shape in %s\n", __func__, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
+        }
+
+        if (result.n_embd == -1) {
+            result.n_embd = ggml_nelements(tensor);
+        } else if (ggml_nelements(tensor) != result.n_embd) {
+            fprintf(stderr, "%s: direction tensor in %s does not match previous dimensions\n", __func__, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
+        }
+
+        // extend if necessary - do not store data for layer 0 (it's not used)
+        result.data.resize(std::max(result.data.size(), static_cast<size_t>(result.n_embd * layer_idx)), 0.0f);
+
+        const float * src = (const float *) tensor->data;
+        float * dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
+        for (int j = 0; j < result.n_embd; j++) {
+            dst[j] += src[j] * load_info.strength;  // allows multiple directions for same layer in same file
+        }
+
     }
+
+    if (result.n_embd == -1) {
+        fprintf(stderr, "%s: skipping %s due to invalid direction tensors\n", __func__, load_info.fname.c_str());
+        result.data.clear();
+    }
+
+    gguf_free(ctx_gguf);
+    ggml_free(ctx);
 
     return result;
 }
@@ -3214,16 +5062,19 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
         auto cur = llama_control_vector_load_one(info);
 
         if (cur.n_embd == -1) {
-            return result;
+            result.n_embd = -1;
+            break;
         }
-        if (result.n_embd != -1 && (result.n_embd != cur.n_embd || result.data.size() != cur.data.size())) {
-            fprintf(stderr, "%s: control vector in %s does not match previous vector dimensions\n", __func__, info.fname.c_str());
-            return result;
+        if (result.n_embd != -1 && result.n_embd != cur.n_embd) {
+            fprintf(stderr, "%s: control vectors in %s does not match previous dimensions\n", __func__, info.fname.c_str());
+            result.n_embd = -1;
+            break;
         }
 
         if (result.n_embd == -1) {
             result = std::move(cur);
         } else {
+            result.data.resize(std::max(result.data.size(), cur.data.size()), 0.0f);  // extend if necessary
             for (size_t i = 0; i < cur.data.size(); i++) {
                 result.data[i] += cur.data[i];
             }
@@ -3231,7 +5082,8 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
     }
 
     if (result.n_embd == -1) {
-        fprintf(stderr, "%s: no vectors passed\n", __func__);
+        fprintf(stderr, "%s: no valid control vector files passed\n", __func__);
+        result.data.clear();
     }
 
     return result;
@@ -3301,7 +5153,7 @@ void yaml_dump_string_multiline(FILE * stream, const char * prop_name, const cha
 
 void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const llama_context * lctx,
                                const std::string & timestamp, const std::vector<int> & prompt_tokens, const char * model_desc) {
-    const llama_sampling_params & sparams = params.sparams;
+    const common_params_sampling & sparams = params.sparams;
 
     fprintf(stream, "build_commit: %s\n",        LLAMA_COMMIT);
     fprintf(stream, "build_number: %d\n",        LLAMA_BUILD_NUMBER);
@@ -3357,10 +5209,14 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "chunks: %d # default: -1 (unlimited)\n", params.n_chunks);
     fprintf(stream, "color: %s # default: false\n", params.use_color ? "true" : "false");
     fprintf(stream, "ctx_size: %d # default: 512\n", params.n_ctx);
+    fprintf(stream, "dry_allowed_length: %d # default: 2\n", sparams.dry_allowed_length);
+    fprintf(stream, "dry_base: %.2f # default: 1.75\n", sparams.dry_base);
+    fprintf(stream, "dry_multiplier: %.1f # default: 0.0\n", sparams.dry_multiplier);
+    fprintf(stream, "dry_penalty_last_n: %d # default: -1 (0 = disable, -1 = context size)\n", sparams.dry_penalty_last_n);
     fprintf(stream, "escape: %s # default: false\n", params.escape ? "true" : "false");
     fprintf(stream, "file: # never logged, see prompt instead. Can still be specified for input.\n");
     fprintf(stream, "frequency_penalty: %f # default: 0.0 \n", sparams.penalty_freq);
-    yaml_dump_string_multiline(stream, "grammar", sparams.grammar.c_str());
+    yaml_dump_string_multiline(stream, "grammar", sparams.grammar.grammar.c_str());
     fprintf(stream, "grammar-file: # never logged, see grammar instead. Can still be specified for input.\n");
     fprintf(stream, "hellaswag: %s # default: false\n", params.hellaswag ? "true" : "false");
     fprintf(stream, "hellaswag_tasks: %zu # default: 400\n", params.hellaswag_tasks);
@@ -3371,7 +5227,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
 
     yaml_dump_string_multiline(stream, "in_prefix", params.input_prefix.c_str());
     fprintf(stream, "in_prefix_bos: %s # default: false\n", params.input_prefix_bos ? "true" : "false");
-    yaml_dump_string_multiline(stream, "in_suffix", params.input_prefix.c_str());
+    yaml_dump_string_multiline(stream, "in_suffix", params.input_suffix.c_str());
     fprintf(stream, "interactive: %s # default: false\n", params.interactive ? "true" : "false");
     fprintf(stream, "interactive_first: %s # default: false\n", params.interactive_first ? "true" : "false");
     fprintf(stream, "keep: %d # default: 0\n", params.n_keep);
@@ -3386,33 +5242,46 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     }
 
     fprintf(stream, "lora:\n");
-    for (std::tuple<std::string, float> la : params.lora_adapter) {
-        if (std::get<1>(la) != 1.0f) {
-            continue;
+    for (auto & la : params.lora_adapters) {
+        if (la.scale == 1.0f) {
+            fprintf(stream, "  - %s\n", la.path.c_str());
         }
-        fprintf(stream, "  - %s\n", std::get<0>(la).c_str());
     }
     fprintf(stream, "lora_scaled:\n");
-    for (std::tuple<std::string, float> la : params.lora_adapter) {
-        if (std::get<1>(la) == 1.0f) {
-            continue;
+    for (auto & la : params.lora_adapters) {
+        if (la.scale != 1.0f) {
+            fprintf(stream, "  - %s: %f\n", la.path.c_str(), la.scale);
         }
-        fprintf(stream, "  - %s: %f\n", std::get<0>(la).c_str(), std::get<1>(la));
     }
-    fprintf(stream, "lora_base: %s\n", params.lora_base.c_str());
+    fprintf(stream, "lora_init_without_apply: %s # default: false\n", params.lora_init_without_apply ? "true" : "false");
     fprintf(stream, "main_gpu: %d # default: 0\n", params.main_gpu);
+    fprintf(stream, "max_gpu: %d # default: 0\n", params.max_gpu);
+    fprintf(stream, "ncmoe: %d # default: 0\n", params.ncmoe);
+    fprintf(stream, "fit: %d # default: false\n", params.fit);
+    fprintf(stream, "fit_margin: %d # default: 0\n", params.fit_margin);
+    fprintf(stream, "worst_graph_tokens: %d # default: 0\n", params.worst_graph_tokens);
     fprintf(stream, "min_keep: %d # default: 0 (disabled)\n", sparams.min_keep);
     fprintf(stream, "mirostat: %d # default: 0 (disabled)\n", sparams.mirostat);
     fprintf(stream, "mirostat_ent: %f # default: 5.0\n", sparams.mirostat_tau);
     fprintf(stream, "mirostat_lr: %f # default: 0.1\n", sparams.mirostat_eta);
+    fprintf(stream, "xtc_probability: %f # default: 0.0\n", sparams.xtc_probability);
+    fprintf(stream, "xtc_threshold: %f # default: 0.0\n", sparams.xtc_threshold);
+    fprintf(stream, "top_n_sigma: %f # default: 0.0\n", sparams.top_n_sigma);
     fprintf(stream, "mlock: %s # default: false\n", params.use_mlock ? "true" : "false");
     fprintf(stream, "model: %s # default: %s\n", params.model.c_str(), DEFAULT_MODEL_PATH);
-    fprintf(stream, "model_draft: %s # default:\n", params.model_draft.c_str());
+    fprintf(stream, "model_draft: %s # default:\n", params.speculative.model.c_str());
     fprintf(stream, "multiline_input: %s # default: false\n", params.multiline_input ? "true" : "false");
     fprintf(stream, "n_gpu_layers: %d # default: -1\n", params.n_gpu_layers);
     fprintf(stream, "n_predict: %d # default: -1 (unlimited)\n", params.n_predict);
     fprintf(stream, "n_probs: %d # only used by server binary, default: 0\n", sparams.n_probs);
     fprintf(stream, "no_mmap: %s # default: false\n", !params.use_mmap ? "true" : "false");
+    fprintf(stream, "repack: %s # default: false\n", params.repack_tensors ? "true" : "false");
+    fprintf(stream, "use_thp: %s # default: false\n", params.use_thp ? "true" : "false");
+    fprintf(stream, "validate_quants: %s # default: false\n", params.validate_quants ? "true" : "false");
+    fprintf(stream, "merge_qkv: %s # default: false\n", params.merge_qkv ? "true" : "false");
+    fprintf(stream, "merge_up_gate_exps: %s # default: false\n", params.merge_up_gate_exps ? "true" : "false");
+    fprintf(stream, "defer_experts: %s # default: false\n", params.defer_experts ? "true" : "false");
+    fprintf(stream, "max_extra_alloc: %d # default: 256\n", params.max_extra_alloc_MiB);
     fprintf(stream, "penalize_nl: %s # default: false\n", sparams.penalize_nl ? "true" : "false");
     fprintf(stream, "ppl_output_type: %d # default: 0\n", params.ppl_output_type);
     fprintf(stream, "ppl_stride: %d # default: 0\n", params.ppl_stride);
@@ -3441,6 +5310,21 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "simple_io: %s # default: false\n", params.simple_io ? "true" : "false");
     fprintf(stream, "cont_batching: %s # default: false\n", params.cont_batching ? "true" : "false");
     fprintf(stream, "flash_attn: %s # default: false\n", params.flash_attn ? "true" : "false");
+    fprintf(stream, "mla_attn: %d # default: 0\n", params.mla_attn);
+    fprintf(stream, "attn_max_batch: %d # default: 0\n", params.attn_max_batch);
+    fprintf(stream, "fused_moe: %s # default: false\n", params.fused_moe_up_gate ? "true" : "false");
+    fprintf(stream, "grouped_expert_routing: %s # default: false\n", params.grouped_expert_routing ? "true" : "false");
+    fprintf(stream, "fused_up_gate: %s # default: true\n", params.fused_up_gate ? "true" : "false");
+    fprintf(stream, "fused_mmad: %s # default: true\n", params.fused_mmad ? "true" : "false");
+    fprintf(stream, "rope_cache: %s # default: false\n", params.rope_cache ? "true" : "false");
+    fprintf(stream, "graph_reuse: %s # default: false\n", params.graph_reuse ? "true" : "false");
+    fprintf(stream, "k_cache_hadamard: %s # default: false\n", params.k_cache_hadamard ? "true" : "false");
+    fprintf(stream, "v_cache_hadamard: %s # default: false\n", params.v_cache_hadamard ? "true" : "false");
+    fprintf(stream, "split_mode_graph_scheduling: %s # default: false\n", params.split_mode_graph_scheduling ? "true" : "false");
+    //fprintf(stream, "split_mode_f16: %s # default: true\n", params.split_mode_f16 ? "true" : "false");
+    fprintf(stream, "reduce_type: %s # default f16\n", params.reduce_type.c_str());
+    fprintf(stream, "scheduler_async: %s # default: false\n", params.scheduler_async ? "true" : "false");
+    fprintf(stream, "ser: %d,%g # defaulr: -1,0\n", params.min_experts, params.thresh_experts);
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
 
     const std::vector<float> tensor_split_vector(params.tensor_split, params.tensor_split + llama_max_devices());
@@ -3452,6 +5336,212 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "top_p: %f # default: 0.95\n", sparams.top_p);
     fprintf(stream, "min_p: %f # default: 0.0\n", sparams.min_p);
     fprintf(stream, "typical_p: %f # default: 1.0\n", sparams.typical_p);
+    fprintf(stream, "adaptive_target: %f # default: -1.0\n", sparams.adaptive_target);
+    fprintf(stream, "adaptive_decay: %f # default: 0.9\n", sparams.adaptive_decay);
+    fprintf(stream, "adaptive_updt_w_cur: %s # default: false\n", sparams.adaptive_updt_w_cur ? "true" : "false");
     fprintf(stream, "verbose_prompt: %s # default: false\n", params.verbose_prompt ? "true" : "false");
     fprintf(stream, "display_prompt: %s # default: true\n", params.display_prompt ? "true" : "false");
+}
+
+//
+// Argparse utils
+//
+
+std::tuple<uint32_t, uint32_t, std::string, float> argparse_allowlist_unicode_rule(std::string argstr) {
+    // format:
+    //   LOWER..UPPER,SCRIPT:BIAS
+
+    auto subs = string_split(argstr, ":");
+    float bias = subs.size() == 1 ? 0 : std::stof(subs[1]);
+
+    subs = string_split(subs[0], ",");
+    std::string script = std::all_of(subs.back().begin(), subs.back().end(), [](char c) {
+        return std::isalpha(c);
+    }) ? string_lower(subs.back()) : "*";
+    if (script == "ascii") {
+        return { 0x000000, 0x00007F, "*", bias };
+    }
+
+    uint32_t first = 0;
+    uint32_t last = -1;
+    if ((script == "*") || (subs.size() > 1)) {
+        subs = string_split(subs.front(), ".");
+        if (!subs.front().empty()) {
+            first = std::stoul(subs.front());
+        }
+        if (!subs.back().empty()) {
+            last = std::stoul(subs.back());
+        }
+    }
+
+    return { std::min(first, last), std::max(first, last), script, bias };
+}
+
+void argparse_expiring_logit_bias(const std::string& content, common_params_sampling& sparams) {
+    auto elb_params = sparams.elb_params;
+    elb_params.push_back({ { }, "", "" });
+    auto entries = elb_params[0].entries;
+
+    const auto lines = string_split(content, "\n");
+    for (size_t i = 0; i < lines.size(); ++i) {
+        auto line = string_strip(lines[i]);
+        const char c0 = line.empty() ? '#' : line[0];
+        if (c0 == '#') {
+            LLAMA_LOG_DEBUG("%s: line %zu: comment or empty\n", __func__, i);
+            continue;   // next line
+        }
+
+        // (... "EXTRACT" ... "EXTRACT" ...)
+        std::vector<size_t> qq_posi = { 0 };
+        auto extracts = string_extract(line, '"', qq_posi);
+        qq_posi.push_back(std::string::npos);
+        for (int32_t j = 0; j < int32_t(qq_posi.size()) - 1; j += 2) {
+            const auto pnd_pos = line.find('#', qq_posi[j]);
+            if (pnd_pos < qq_posi[j + 1]) {
+                LLAMA_LOG_DEBUG("%s: line %zu: inline comment @ %zu\n", __func__, i, pnd_pos);
+                line = string_strip(line.substr(0, pnd_pos));
+                qq_posi.resize(j + 2);
+                qq_posi.back() = std::string::npos;
+                extracts.resize(j / 2);
+                break;
+            }
+        }
+        const auto last_qq_pos = qq_posi[qq_posi.size() - 2];
+
+        auto n_char = line.length();
+        const char cE = line[n_char - 1];
+
+        LLAMA_LOG_DEBUG("%s: line %zu: %s\n", __func__, i, line.c_str());
+        if ('(' == c0 && cE == ')') {
+            const bool is_nested = '(' == line[1] && line[n_char - 2] == ')';
+            if (is_nested) {
+                if (n_char == 4) {
+                    // (())
+                    entries.clear();
+                    LLAMA_LOG_DEBUG("%s: line %zu: persistent entry clear\n", __func__, i);
+                    continue;   // next line
+                }
+                n_char -= 2;
+                line = line.substr(1, n_char);
+                LLAMA_LOG_DEBUG("%s: line %zu: persistent entry\n", __func__, i);
+            }
+
+            // (DURATION : ...)
+            int32_t duration = is_nested ? -1 : 1;
+            const auto cln_pos = line.find(':');
+            if ((cln_pos != std::string::npos) && (1 < cln_pos) && (cln_pos < qq_posi[1])) {
+                duration = std::stoi(line.substr(1, cln_pos - 1));
+            }
+            if (duration == 0) {
+                LLAMA_LOG_DEBUG("%s: line %zu: invalid duration\n", __func__, i);
+                continue;   // next line
+            }
+
+            #undef X
+            #define X(T, MEMBER, DV, PRECAST) #MEMBER,
+            static const std::vector<std::string> names = { X_COMMON_PARAMS_SAMPLING };
+
+            std::vector<float> addsubs(names.size(), 0.0f);
+            bool is_sb = false;
+
+            // (... : SPARAM ...)
+            const auto window = line.substr(last_qq_pos + 1);
+            for (int j = 0; j < names.size(); ++j) {
+                const auto& name = names[j];
+                auto pos = window.find(name);
+                if (pos != std::string::npos) {
+                    pos += name.length();
+                    auto next_pos = window.find(",", pos + 1);
+                    if (next_pos == std::string::npos) {
+                        next_pos = n_char - 1;
+                    }
+                    auto sub = string_strip(window.substr(pos, next_pos - pos));
+                    if (sub[0] == '~') {
+                        addsubs[j] += std::stof(sub.substr(1));
+                        is_sb = true;
+                        LLAMA_LOG_DEBUG("%s: line %zu: bias = %f\n", __func__, i, addsubs[j]);
+                    }
+                }
+            }
+
+            auto& phrases = extracts;
+            if (phrases.empty()) {
+                if (is_sb) {
+                    phrases.push_back("");
+                } else {
+                    continue;   // next line
+                }
+            }
+
+            const auto n_phrase = phrases.size();
+            std::vector<float> biases;
+            bool is_range = false;
+
+            if (!is_sb) {
+                // (... : BIAS ...)
+                const auto cln_rpos = line.rfind(':');
+                auto sub = line.substr(cln_rpos + 1, n_char - cln_rpos - 2);
+                if (sub.find("~") != std::string::npos) {
+                    // (... : BIAS ~ BIAS)
+                    const auto splits = string_split(sub, '~');
+                    biases.push_back(std::stof(splits.front()));
+                    LLAMA_LOG_DEBUG("%s: line %zu: logit bias = %f\n", __func__, i, biases.back());
+                    biases.push_back(std::stof(splits.back()));
+                    LLAMA_LOG_DEBUG("%s: line %zu: logit bias = %f\n", __func__, i, biases.back());
+                    is_range = true;
+                } else {
+                    // (... : BIAS, BIAS, ..., BIAS)
+                    for (const auto& split: string_split(sub, ',')) {
+                        if (!split.empty()) {
+                            biases.push_back(std::stof(split));
+                            LLAMA_LOG_DEBUG("%s: line %zu: logit bias = %f\n", __func__, i, biases.back());
+                        }
+                    }
+                }
+                if (biases.empty()) {
+                    continue;   // next line
+                }
+            }
+
+            size_t max_phrase_len = 0;
+            for (const auto& phrase: phrases) {
+                LLAMA_LOG_DEBUG("%s: line %zu: phrase = \"%s\"\n", __func__, i, phrase.c_str());
+                max_phrase_len = std::max(phrase.length(), max_phrase_len);
+            }
+            LLAMA_LOG_DEBUG("%s: line %zu: max_phrase_len = %zu\n", __func__, i, max_phrase_len);
+
+            common_params_sampling::elb_param::elb_entry entry = {
+                std::vector<size_t>(n_phrase, 0),
+                std::move(addsubs),
+                std::vector<bool>(n_phrase, false),
+                max_phrase_len,
+                std::move(phrases),
+                std::move(biases),
+                duration,
+                is_range
+            };
+            if (is_nested) {
+                entries.push_back(entry);
+            }
+            elb_params.back().entries.push_back(std::move(entry));
+            continue;   // next line
+        }
+
+        if (last_qq_pos > 0) {
+            elb_params.back().op = string_strip(line.substr(last_qq_pos + 1));
+        }
+
+        auto& exitwords = extracts;
+        if (exitwords.empty()) {
+            string_process_escapes(line);
+            exitwords.push_back(std::move(line));
+        }
+
+        // maybe support multiple exitwords in future
+        elb_params.back().exitword = std::move(exitwords[0]);
+
+        elb_params.push_back({ entries, "", "" });
+    }
+
+    sparams.elb_params = std::move(elb_params);
 }

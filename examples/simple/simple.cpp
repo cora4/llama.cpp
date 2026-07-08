@@ -35,9 +35,9 @@ int main(int argc, char ** argv) {
 
     // initialize the model
 
-    llama_model_params model_params = llama_model_params_from_gpt_params(params);
+    llama_model_params model_params = common_model_params_to_llama(params);
 
-    llama_model * model = llama_load_model_from_file(params.model.c_str(), model_params);
+    llama_model * model = llama_model_load_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {
         fprintf(stderr , "%s: error: unable to load model\n" , __func__);
@@ -46,9 +46,9 @@ int main(int argc, char ** argv) {
 
     // initialize the context
 
-    llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+    llama_context_params ctx_params = common_context_params_to_llama(params);
 
-    llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
@@ -58,7 +58,7 @@ int main(int argc, char ** argv) {
     // tokenize the prompt
 
     std::vector<llama_token> tokens_list;
-    tokens_list = ::llama_tokenize(ctx, params.prompt, true);
+    tokens_list = ::common_tokenize(ctx, params.prompt, true);
 
     const int n_ctx    = llama_n_ctx(ctx);
     const int n_kv_req = tokens_list.size() + (n_predict - tokens_list.size());
@@ -77,7 +77,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
 
     for (auto id : tokens_list) {
-        fprintf(stderr, "%s", llama_token_to_piece(ctx, id).c_str());
+        fprintf(stderr, "%s", common_token_to_piece(ctx, id).c_str());
     }
 
     fflush(stderr);
@@ -89,7 +89,7 @@ int main(int argc, char ** argv) {
 
     // evaluate the initial prompt
     for (size_t i = 0; i < tokens_list.size(); i++) {
-        llama_batch_add(batch, tokens_list[i], i, { 0 }, false);
+        common_batch_add(batch, tokens_list[i], i, { 0 }, false);
     }
 
     // llama_decode will output logits only for the last token of the prompt
@@ -132,14 +132,14 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            LOG_TEE("%s", llama_token_to_piece(ctx, new_token_id).c_str());
+            LOG_TEE("%s", common_token_to_piece(ctx, new_token_id).c_str());
             fflush(stdout);
 
             // prepare the next batch
-            llama_batch_clear(batch);
+            common_batch_clear(batch);
 
             // push this new token for next evaluation
-            llama_batch_add(batch, new_token_id, n_cur, { 0 }, true);
+            common_batch_add(batch, new_token_id, n_cur, { 0 }, true);
 
             n_decode += 1;
         }

@@ -62,9 +62,9 @@ int main(int argc, char ** argv) {
 
     // initialize the model
 
-    llama_model_params model_params = llama_model_params_from_gpt_params(params);
+    llama_model_params model_params = common_model_params_to_llama(params);
 
-    llama_model * model = llama_load_model_from_file(params.model.c_str(), model_params);
+    llama_model * model = llama_model_load_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {
         fprintf(stderr , "%s: error: unable to load model\n" , __func__);
@@ -73,13 +73,13 @@ int main(int argc, char ** argv) {
 
     // initialize the context
 
-    llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+    llama_context_params ctx_params = common_context_params_to_llama(params);
 
     ctx_params.n_ctx = llama_n_ctx_train(model)*n_grp + n_keep;
 
     GGML_ASSERT(ctx_params.n_batch % n_grp == 0 && "n_batch must be divisible by n_grp");
 
-    llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
@@ -88,10 +88,10 @@ int main(int argc, char ** argv) {
 
     // tokenize the prompt
     std::vector<llama_token> tokens_list;
-    tokens_list = ::llama_tokenize(ctx, params.prompt, true);
+    tokens_list = ::common_tokenize(ctx, params.prompt, true);
 
     // tokenize the prefix and use it as a sink
-    const int n_tokens_prefix = ::llama_tokenize(ctx, prompt_prefix, true).size();
+    const int n_tokens_prefix = ::common_tokenize(ctx, prompt_prefix, true).size();
 
     const int n_tokens_all = tokens_list.size();
 
@@ -133,10 +133,10 @@ int main(int argc, char ** argv) {
             n_past = llama_kv_cache_seq_pos_max(ctx, 0) + 1;
         }
 
-        llama_batch_clear(batch);
+        common_batch_clear(batch);
 
         for (int j = 0; j < n_batch && i + j < n_tokens_all; j++) {
-            llama_batch_add(batch, tokens_list[i + j], n_past++, { 0 }, false);
+            common_batch_add(batch, tokens_list[i + j], n_past++, { 0 }, false);
         }
 
         if (i + n_batch >= n_tokens_all) {
@@ -167,10 +167,10 @@ int main(int argc, char ** argv) {
 
         n_past = llama_kv_cache_seq_pos_max(ctx, 0) + 1;
 
-        llama_batch_clear(batch);
+        common_batch_clear(batch);
 
         for (int j = 0; j < n_batch && i + j < n_tokens_all; j++) {
-            llama_batch_add(batch, tokens_list[i + j], n_past++, { 0 }, false);
+            common_batch_add(batch, tokens_list[i + j], n_past++, { 0 }, false);
         }
 
         if (i + n_batch >= n_tokens_all) {
@@ -239,16 +239,16 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            LOG_TEE("%s", llama_token_to_piece(ctx, new_token_id).c_str());
+            LOG_TEE("%s", common_token_to_piece(ctx, new_token_id).c_str());
             fflush(stdout);
 
             n_decode += 1;
 
             // prepare the next batch
-            llama_batch_clear(batch);
+            common_batch_clear(batch);
 
             // push this new token for next evaluation
-            llama_batch_add(batch, new_token_id, n_past++, { 0 }, true);
+            common_batch_add(batch, new_token_id, n_past++, { 0 }, true);
         }
 
         n_cur += 1;

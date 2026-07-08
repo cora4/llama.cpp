@@ -20,7 +20,7 @@ int main(int argc, char ** argv){
     }
 
     // max. number of additional tokens to draft if match is found
-    const int n_draft = params.n_draft;
+    const int n_draft = params.speculative.n_max;
 
     const bool dump_kv_cache = params.dump_kv_cache;
 
@@ -34,40 +34,39 @@ int main(int argc, char ** argv){
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    llama_model * model = NULL;
-    llama_context * ctx = NULL;
-
     // load the model
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
-    GGML_ASSERT(llama_n_vocab(model) < (1 << 16));
+    llama_init_result llama_init = llama_init_from_gpt_params(params);
+
+    llama_model * model = llama_init.model;
+    llama_context * ctx = llama_init.context;
 
     // tokenize the prompt
     std::vector<llama_token> inp;
-    inp = ::llama_tokenize(ctx, params.prompt, true, true);
+    inp = ::common_tokenize(ctx, params.prompt, true, true);
 
-    llama_ngram_cache ngram_cache_context;
-    llama_ngram_cache ngram_cache_dynamic;
-    llama_ngram_cache ngram_cache_static;
+    common_ngram_cache ngram_cache_context;
+    common_ngram_cache ngram_cache_dynamic;
+    common_ngram_cache ngram_cache_static;
     int64_t t_draft_flat_us = 0;
     int64_t t_draft_us = 0;
 
     {
         // Fill up context ngram cache with tokens from user input:
         const int64_t t_start_draft_us = ggml_time_us();
-        llama_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
+        common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
 
-        if (!params.lookup_cache_static.empty()) {
+        if (!params.speculative.lookup_cache_static.empty()) {
             try {
-                ngram_cache_static = llama_ngram_cache_load(params.lookup_cache_static);
+                ngram_cache_static = common_ngram_cache_load(params.speculative.lookup_cache_static);
             } catch (std::ifstream::failure const &) {
-                fprintf(stderr, "error: failed to open static lookup cache: %s", params.lookup_cache_static.c_str());
+                LOG_ERR("failed to open static lookup cache: %s", params.speculative.lookup_cache_static.c_str());
                 exit(1);
             }
         }
 
-        if (!params.lookup_cache_dynamic.empty()) {
+        if (!params.speculative.lookup_cache_dynamic.empty()) {
             try {
-                ngram_cache_dynamic = llama_ngram_cache_load(params.lookup_cache_dynamic);
+                ngram_cache_dynamic = common_ngram_cache_load(params.speculative.lookup_cache_dynamic);
             } catch (std::ifstream::failure const &) {} // if the file does not exist it will simply be created at the end of the program
         }
 
@@ -85,7 +84,7 @@ int main(int argc, char ** argv){
     fprintf(stderr, "\n\n");
 
     for (auto id : inp) {
-        fprintf(stderr, "%s", llama_token_to_piece(ctx, id).c_str());
+        fprintf(stderr, "%s", common_token_to_piece(ctx, id).c_str());
     }
 
     fflush(stderr);
@@ -107,7 +106,7 @@ int main(int argc, char ** argv){
 
     bool has_eos = false;
 
-    struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
+    struct common_sampler * ctx_sampling = common_sampler_init(model , params.sparams);
 
     std::vector<llama_token> draft;
 
@@ -131,11 +130,11 @@ int main(int argc, char ** argv){
         int i_dft = 0;
         while (true) {
             // sample from the target model
-            llama_token id = llama_sampling_sample(ctx_sampling, ctx, NULL, i_dft);
+            llama_token id = common_sampler_sample(ctx_sampling, ctx, i_dft);
 
-            llama_sampling_accept(ctx_sampling, ctx, id, true);
+            common_sampler_accept(ctx_sampling, ctx, id, true);
 
-            const std::string token_str = llama_token_to_piece(ctx, id);
+            const std::string token_str = common_token_to_piece(ctx, id);
 
             if (!params.use_color) {
                 printf("%s", token_str.c_str());
@@ -157,7 +156,7 @@ int main(int argc, char ** argv){
                 {
                     // Update context ngram cache with the newly accepted token:
                     const int64_t t_start_draft_us = ggml_time_us();
-                    llama_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
+                    common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
                     t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
 
@@ -183,7 +182,7 @@ int main(int argc, char ** argv){
             {
                 // Update context ngram cache with the newly accepted token:
                 const int64_t t_start_draft_us = ggml_time_us();
-                llama_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
+                common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
                 t_draft_us += ggml_time_us() - t_start_draft_us;
             }
             break;
@@ -197,18 +196,18 @@ int main(int argc, char ** argv){
         // clean the cache of draft tokens that weren't accepted
         llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 
-        llama_batch_clear(batch_tgt);
-        llama_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
 
         // Draft already contains a single token sampled from the model:
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
         const int64_t t_start_draft_us = ggml_time_us();
 
-        llama_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
+        common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
 
         for (size_t i = 1; i < draft.size(); ++i) {
-            llama_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+            common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
         }
 
         t_draft_us += ggml_time_us() - t_start_draft_us;
@@ -223,8 +222,8 @@ int main(int argc, char ** argv){
     auto t_dec_end = ggml_time_us();
 
     // Update dynamic ngram cache with context ngram cache and save it to disk:
-    llama_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
-    llama_ngram_cache_save(ngram_cache_dynamic, params.lookup_cache_dynamic);
+    common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
+    common_ngram_cache_save(ngram_cache_dynamic, params.speculative.lookup_cache_dynamic);
 
     LOG_TEE("\n\n");
 
@@ -244,7 +243,7 @@ int main(int argc, char ** argv){
     LOG_TEE("\ntarget:\n");
     llama_print_timings(ctx);
 
-    llama_sampling_free(ctx_sampling);
+    common_sampler_free(ctx_sampling);
     llama_batch_free(batch_tgt);
 
     llama_free(ctx);

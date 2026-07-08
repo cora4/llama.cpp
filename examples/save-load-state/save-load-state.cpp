@@ -28,17 +28,18 @@ int main(int argc, char ** argv) {
     std::string result2;
 
     // init
-    llama_model * model;
-    llama_context * ctx;
+    llama_init_result llama_init = llama_init_from_gpt_params(params);
 
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
+    llama_model * model = llama_init.model;
+    llama_context * ctx = llama_init.context;
+
     if (model == nullptr || ctx == nullptr) {
         fprintf(stderr, "%s : failed to init\n", __func__);
         return 1;
     }
 
     // tokenize prompt
-    auto tokens = llama_tokenize(ctx, params.prompt, true);
+    auto tokens = common_tokenize(ctx, params.prompt, true);
 
     // evaluate prompt
     llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size(), n_past, 0));
@@ -47,7 +48,7 @@ int main(int argc, char ** argv) {
     // save state (rng, logits, embedding and kv_cache) to file
     {
         std::vector<uint8_t> state_mem(llama_state_get_size(ctx));
-        const size_t written = llama_state_get_data(ctx, state_mem.data());
+        const size_t written = llama_state_get_data(ctx, state_mem.data(), state_mem.size());
 
         FILE *fp_write = fopen("dump_state.bin", "wb");
         fwrite(state_mem.data(), 1, written, fp_write);
@@ -73,7 +74,7 @@ int main(int argc, char ** argv) {
         }
         llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
         auto next_token = llama_sample_token(ctx, &candidates_p);
-        auto next_token_str = llama_token_to_piece(ctx, next_token);
+        auto next_token_str = common_token_to_piece(ctx, next_token);
 
         printf("%s", next_token_str.c_str());
         result0 += next_token_str;
@@ -93,19 +94,22 @@ int main(int argc, char ** argv) {
     llama_free(ctx);
 
     // make new context
-    auto * ctx2 = llama_new_context_with_model(model, llama_context_params_from_gpt_params(params));
+    auto * ctx2 = llama_init_from_model(model, common_context_params_to_llama(params));
 
     printf("\nsecond run: %s", params.prompt.c_str());
 
     // load state (rng, logits, embedding and kv_cache) from file
     {
-        std::vector<uint8_t> state_mem(llama_state_get_size(ctx2));
+        std::vector<uint8_t> state_mem;
 
         FILE * fp_read = fopen("dump_state.bin", "rb");
+        fseek(fp_read, 0, SEEK_END);
+        state_mem.resize(ftell(fp_read));
+        fseek(fp_read, 0, SEEK_SET);
         const size_t read = fread(state_mem.data(), 1, state_mem.size(), fp_read);
         fclose(fp_read);
 
-        if (read != llama_state_set_data(ctx2, state_mem.data())) {
+        if (read != llama_state_set_data(ctx2, state_mem.data(), state_mem.size())) {
             fprintf(stderr, "\n%s : failed to read state\n", __func__);
             llama_free(ctx2);
             llama_free_model(model);
@@ -129,7 +133,7 @@ int main(int argc, char ** argv) {
         }
         llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
         auto next_token = llama_sample_token(ctx2, &candidates_p);
-        auto next_token_str = llama_token_to_piece(ctx2, next_token);
+        auto next_token_str = common_token_to_piece(ctx2, next_token);
 
         printf("%s", next_token_str.c_str());
         result1 += next_token_str;
@@ -153,19 +157,22 @@ int main(int argc, char ** argv) {
     }
 
     // make new context
-    auto* ctx3 = llama_new_context_with_model(model, llama_context_params_from_gpt_params(params));
+    auto* ctx3 = llama_init_from_model(model, common_context_params_to_llama(params));
 
     printf("\nsingle seq run: %s", params.prompt.c_str());
 
     // load state (rng, logits, embedding and kv_cache) from file
     {
-        std::vector<uint8_t> state_mem(llama_state_get_size(ctx3));
+        std::vector<uint8_t> state_mem;
 
         FILE * fp_read = fopen("dump_state.bin", "rb");
+        fseek(fp_read, 0, SEEK_END);
+        state_mem.resize(ftell(fp_read));
+        fseek(fp_read, 0, SEEK_SET);
         const size_t read = fread(state_mem.data(), 1, state_mem.size(), fp_read);
         fclose(fp_read);
 
-        if (read != llama_state_set_data(ctx3, state_mem.data())) {
+        if (read != llama_state_set_data(ctx3, state_mem.data(), state_mem.size())) {
             fprintf(stderr, "\n%s : failed to read state\n", __func__);
             llama_free(ctx3);
             llama_free_model(model);
@@ -181,8 +188,8 @@ int main(int argc, char ** argv) {
     // save seq 0 and load into seq 1
     {
         // save kv of seq 0
-        std::vector<uint8_t> seq_store(llama_state_seq_get_size(ctx3, 0));
-        const size_t ncopy = llama_state_seq_get_data(ctx3, seq_store.data(), 0);
+        std::vector<uint8_t> seq_store(llama_state_seq_get_size(ctx3, 0, 0));
+        const size_t ncopy = llama_state_seq_get_data(ctx3, seq_store.data(), seq_store.size(), 0, 0);
         if (ncopy != seq_store.size()) {
             fprintf(stderr, "\n%s : seq copy data length %zd does not match expected length %zd\n", __func__, ncopy, seq_store.size());
             llama_free(ctx3);
@@ -196,7 +203,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : kv cache cleared\n", __func__);
 
         // restore kv into seq 1
-        const size_t nset = llama_state_seq_set_data(ctx3, seq_store.data(), 1);
+        const size_t nset = llama_state_seq_set_data(ctx3, seq_store.data(), seq_store.size(), 1, 0);
         if (nset != seq_store.size()) {
             fprintf(stderr, "\n%s : seq set data length %zd does not match expected length %zd\n", __func__, nset, seq_store.size());
             llama_free(ctx3);
@@ -217,7 +224,7 @@ int main(int argc, char ** argv) {
         }
         llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
         auto next_token = llama_sample_token(ctx3, &candidates_p);
-        auto next_token_str = llama_token_to_piece(ctx3, next_token);
+        auto next_token_str = common_token_to_piece(ctx3, next_token);
 
         printf("%s", next_token_str.c_str());
         result2 += next_token_str;

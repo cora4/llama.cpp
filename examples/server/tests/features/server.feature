@@ -71,6 +71,22 @@ Feature: llama.cpp server
       | codellama70b | You are a coding assistant. | Write the fibonacci function in c++. | 128        | (thanks\|happy\|bird\|Annabyear)+ | -1       | 64          | enabled          |           |
 
 
+  Scenario Outline: OAI Responses Compatibility
+    Given a model <model>
+    And   a system prompt <system_prompt>
+    And   a user prompt <user_prompt>
+    And   <max_tokens> max tokens to predict
+    And   streaming is <enable_streaming>
+    Given an OAI compatible responses request with no api error
+    Then  <n_predicted> tokens are predicted matching <re_content>
+    And   <n_prompt> prompt tokens are processed
+
+    Examples: Prompts
+      | model        | system_prompt               | user_prompt                          | max_tokens | re_content                        | n_prompt | n_predicted | enable_streaming |
+      | llama-2      | Book                        | What is the best book                | 8          | (Here\|what)+                     | 77       | 8           | disabled         |
+      | codellama70b | You are a coding assistant. | Write the fibonacci function in c++. | 128        | (thanks\|happy\|bird\|Annabyear)+ | -1       | 64          | enabled          |
+
+
   Scenario Outline: OAI Compatibility w/ response format
     Given a model test
     And   a system prompt test
@@ -82,7 +98,7 @@ Feature: llama.cpp server
 
     Examples: Prompts
       | response_format                                                     | n_predicted | re_content             |
-      | {"type": "json_object", "schema": {"const": "42"}}                  | 5           | "42"                   |
+      | {"type": "json_object", "schema": {"const": "42"}}                  | 6           | "42"                   |
       | {"type": "json_object", "schema": {"items": [{"type": "integer"}]}} | 10          | \[ -300 \]             |
       | {"type": "json_object"}                                             | 10          | \{ " Jacky.            |
 

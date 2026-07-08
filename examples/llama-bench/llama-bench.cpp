@@ -1,3 +1,10 @@
+//
+// Copyright (C) 2023-2025 The llama.cpp authors
+// Copyright (C) 2024-2025 Iwan Kawrakow
+// MIT license
+// SPDX-License-Identifier: MIT
+//
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -23,10 +30,28 @@
 #include "ggml-cuda.h"
 #include "ggml-sycl.h"
 
+#ifdef GGML_USE_CANN
+#include "ggml-cann.h"
+#endif
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#   define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 // utils
 static uint64_t get_time_ns() {
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
+}
+
+template <typename T1, typename T2>
+std::ostream& operator<<(std::ostream& str, const std::pair<T1, T2>& item) {
+    str << '{' << item.first << ", " << item.second << '}';
+    return str;
 }
 
 template<class T>
@@ -92,6 +117,27 @@ static std::string get_cpu_info() {
         }
         fclose(f);
     }
+#elif defined(_WIN32)
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                     TEXT("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"),
+                     0,
+                     KEY_READ,
+                     &hKey) != ERROR_SUCCESS) {
+        // fail to open registry key
+        return "";
+    }
+    char cpu_brand[256];
+    DWORD cpu_brand_size = sizeof(cpu_brand);
+    if (RegQueryValueExA(hKey,
+                        TEXT("ProcessorNameString"),
+                        NULL,
+                        NULL,
+                        (LPBYTE)cpu_brand,
+                        &cpu_brand_size) == ERROR_SUCCESS) {
+        id.assign(cpu_brand, cpu_brand_size);
+    }
+    RegCloseKey(hKey);
 #endif
     // TODO: other platforms
     return id;
@@ -121,6 +167,17 @@ static std::string get_gpu_info() {
         }
     }
 #endif
+#ifdef GGML_USE_CANN
+    uint32_t count = ggml_backend_cann_get_device_count();
+    for (uint32_t i = 0; i < count; i++) {
+        char buf[128];
+        ggml_backend_cann_get_device_description(i, buf, sizeof(buf));
+        id += buf;
+        if (i < count - 1) {
+            id += "/";
+        }
+    }
+#endif
     // TODO: other backends
     return id;
 }
@@ -135,7 +192,7 @@ static const char * output_format_str(output_formats format) {
         case JSON:     return "json";
         case MARKDOWN: return "md";
         case SQL:      return "sql";
-        default: GGML_ASSERT(!"invalid output format");
+        default: GGML_ABORT("invalid output format");
     }
 }
 
@@ -160,8 +217,8 @@ static const char * split_mode_str(llama_split_mode mode) {
     switch (mode) {
         case LLAMA_SPLIT_MODE_NONE:  return "none";
         case LLAMA_SPLIT_MODE_LAYER: return "layer";
-        case LLAMA_SPLIT_MODE_ROW:   return "row";
-        default: GGML_ASSERT(!"invalid split mode");
+        case LLAMA_SPLIT_MODE_GRAPH: return "graph";
+        default: GGML_ABORT("invalid split mode");
     }
 }
 
@@ -171,28 +228,54 @@ static std::string pair_str(const std::pair<int, int> & p) {
     return buf;
 }
 
+// Ser = Smart Expert Reduction
+using Ser = std::pair<int,float>;
+
 struct cmd_params {
     std::vector<std::string> model;
     std::vector<int> n_prompt;
     std::vector<int> n_gen;
     std::vector<std::pair<int, int>> n_pg;
+    std::vector<std::pair<int, int>> n_gp;
     std::vector<int> n_batch;
     std::vector<int> n_ubatch;
     std::vector<ggml_type> type_k;
     std::vector<ggml_type> type_v;
-    std::vector<int> n_threads;
+    std::vector<std::pair<int,int>> n_threads;
     std::vector<int> n_gpu_layers;
     std::vector<std::string> rpc_servers;
     std::vector<llama_split_mode> split_mode;
     std::vector<int> main_gpu;
     std::vector<bool> no_kv_offload;
     std::vector<bool> flash_attn;
+    std::vector<int> mla_attn;
+    std::vector<int> attn_max_batch;
+    std::vector<Ser> ser;
+    std::vector<bool> reuse;
     std::vector<std::vector<float>> tensor_split;
     std::vector<bool> use_mmap;
     std::vector<bool> embeddings;
+    std::vector<llama_model_tensor_buft_override> buft_overrides;
     ggml_numa_strategy numa;
+    std::string cuda_params;
     int reps;
     bool verbose;
+    bool warmup;
+    bool repack = false;
+    bool fmoe = true;
+    bool ger = false;     // ger = Grouped Expert Routing
+    bool no_fug = false;
+    bool use_thp = false;
+    bool no_ooae = false;
+    bool mqkv = false;
+    bool muge = false;
+    bool defer_experts = false;
+    bool rcache = false;
+    bool sas = false;
+    int  max_gpu = 0;
+    bool print_overrides = false;
+    bool fit = false;
+    int  fit_margin = 0;
     output_formats output_format;
     output_formats output_format_stderr;
 };
@@ -202,23 +285,46 @@ static const cmd_params cmd_params_defaults = {
     /* n_prompt             */ {512},
     /* n_gen                */ {128},
     /* n_pg                 */ {},
+    /* n_gp                 */ {},
     /* n_batch              */ {2048},
     /* n_ubatch             */ {512},
     /* type_k               */ {GGML_TYPE_F16},
     /* type_v               */ {GGML_TYPE_F16},
-    /* n_threads            */ {cpu_get_num_math()},
-    /* n_gpu_layers         */ {99},
+    /* n_threads            */ {{cpu_get_num_math(), cpu_get_num_math()}},
+    /* n_gpu_layers         */ {999},
     /* rpc_servers          */ {""},
     /* split_mode           */ {LLAMA_SPLIT_MODE_LAYER},
     /* main_gpu             */ {0},
     /* no_kv_offload        */ {false},
-    /* flash_attn           */ {false},
+    /* flash_attn           */ {true},
+    /* mla_attn             */ {3},
+    /* attn_max_batch       */ {0},
+    /* ser                  */ {{-1,0.0f}},
+    /* reuse                */ {true},
     /* tensor_split         */ {std::vector<float>(llama_max_devices(), 0.0f)},
     /* use_mmap             */ {true},
     /* embeddings           */ {false},
+    /* buft_overrides       */ {},
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
+    /* cuda_params          */ {},
     /* reps                 */ 5,
     /* verbose              */ false,
+    /* warmup               */ true,
+    /* repack               */ false,
+    /* fmoe                 */ true,
+    /* ger                  */ false,
+    /* no_fug               */ false,
+    /* use_thp              */ false,
+    /* no_ooae              */ false,
+    /* mqkv                 */ false,
+    /* muge                 */ false,
+    /* defer_experts        */ false,
+    /* rcache               */ false,
+    /* sas                  */ false,
+    /* max_gpu              */ 0,
+    /* print_overrides      */ false,
+    /* fit                  */ false,
+    /* fit_margin           */ 0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -232,17 +338,24 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -p, --n-prompt <n>                  (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                     (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
     printf("  -pg <pp,tg>                         (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
+    printf("  -gp <pp,tg>                         (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_gp, pair_str), ",").c_str());
     printf("  -b, --batch-size <n>                (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>              (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>            (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>            (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                   (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
+    printf("  -tgb, --threads-gen-batch <n1,n2>   (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>            (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
+    printf("  --n-cpu-moe <n>                     (default: none)\n");
     printf("  -rpc, --rpc <rpc_servers>           (default: %s)\n", join(cmd_params_defaults.rpc_servers, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row>  (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|graph>(default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                 (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>        (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>             (default: %s)\n", join(cmd_params_defaults.flash_attn, ",").c_str());
+    printf("  -mla, --mla-attn <0|1|2>            (default: %s)\n", join(cmd_params_defaults.mla_attn, ",").c_str());
+    printf("  -amb, --attn-max-batch <i>          (default: %s)\n", join(cmd_params_defaults.attn_max_batch, ",").c_str());
+    printf("  -ser, --smart-expert-reduction <i,f>(default: %s)\n", join(cmd_params_defaults.attn_max_batch, ",").c_str());
+    printf("  -gr, --graph-reuse <0|1>            (default: %s)\n", join(cmd_params_defaults.reuse, ",").c_str());
     printf("  -mmp, --mmap <0|1>                  (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  --numa <distribute|isolate|numactl> (default: disabled)\n");
     printf("  -embd, --embeddings <0|1>           (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -251,6 +364,24 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -o, --output <csv|json|md|sql>      (default: %s)\n", output_format_str(cmd_params_defaults.output_format));
     printf("  -oe, --output-err <csv|json|md|sql> (default: %s)\n", output_format_str(cmd_params_defaults.output_format_stderr));
     printf("  -v, --verbose                       (default: %s)\n", cmd_params_defaults.verbose ? "1" : "0");
+    printf("  -w, --warmup <0|1>                  (default: %s)\n", cmd_params_defaults.warmup ? "1" : "0");
+    printf("  -rtr, --run-time-repack <0|1>       (default: %s)\n", cmd_params_defaults.repack ? "1" : "0");
+    printf("  -cuda, --cuda-params <string>       (default: %s)\n", cmd_params_defaults.cuda_params.c_str());
+    printf("  -mqkv, --merge-qkv                  (default: %s)\n", cmd_params_defaults.mqkv ? "1" : "0");
+    printf("  -muge, --merge-up-gate-experts      (default: %s)\n", cmd_params_defaults.muge ? "1" : "0");
+    printf("  --defer-experts                     (Linux only, default: %s)\n", cmd_params_defaults.defer_experts ? "1" : "0");
+    printf("  -rcache, --rope-cache               (default: %s)\n", cmd_params_defaults.rcache ? "1" : "0");
+    printf("  -thp, --transparent-huge-pages <0|1> (default: %s)\n", cmd_params_defaults.use_thp? "1" : "0");
+    printf("  -ot, --override-tensor pattern      (default: none)\n");
+    printf("  -fmoe, --fused-moe <0|1>            (default: %s)\n", cmd_params_defaults.fmoe? "1" : "0");
+    printf("  -ger, --grouped-expert-routing <0|1>(default: %s)\n", cmd_params_defaults.ger ? "1" : "0");
+    printf("  -no-fug, --no-fused-up-gate <0|1>   (default: %s)\n", cmd_params_defaults.no_fug? "1" : "0");
+    printf("  -no-ooae, --no-offload-only-active-experts <0|1>   (default: %s)\n", cmd_params_defaults.no_ooae? "1" : "0");
+    printf("  -sas, --scheduler-async <0|1>       (default: %s)\n", cmd_params_defaults.sas ? "1" : "0");
+    printf("  --fit <0|1>                         (default: %s)\n", cmd_params_defaults.fit ? "1" : "0");
+    printf("  --fit-margin N                      (default: %d)\n", cmd_params_defaults.fit_margin);
+    printf("  --max-gpu <N>                       (default: %d)\n", cmd_params_defaults.max_gpu);
+    printf("        --print-overrides <0|1>       (default: %s)\n", cmd_params_defaults.print_overrides ? "1" : "0");
     printf("\n");
     printf("Multiple values can be given for each parameter by separating them with ',' or by specifying the parameter multiple times.\n");
 }
@@ -258,6 +389,9 @@ static void print_usage(int /* argc */, char ** argv) {
 static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "f16") {
         return GGML_TYPE_F16;
+    }
+    if (s == "bf16") {
+        return GGML_TYPE_BF16;
     }
     if (s == "q8_0") {
         return GGML_TYPE_Q8_0;
@@ -277,10 +411,95 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
+    if (s == "q6_0") {
+        return GGML_TYPE_Q6_0;
+    }
+    if (s == "q8_KV") {
+        return GGML_TYPE_Q8_KV;
+    }
 
     return GGML_TYPE_COUNT;
 }
 
+namespace {
+bool parse_buft_overrides(const std::string& value, std::vector<llama_model_tensor_buft_override>& overrides) {
+    /* static */ std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+    if (buft_list.empty()) {
+        // enumerate all the devices and add their buffer types to the list
+        for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
+            //auto * dev = ggml_backend_reg_get_name(i);
+            auto * buft = ggml_backend_reg_get_default_buffer_type(i);
+            if (buft) {
+                buft_list[ggml_backend_buft_name(buft)] = buft;
+            }
+        }
+    }
+    for (const auto & override : string_split<std::string>(value, ',')) {
+        std::string::size_type pos = override.find('=');
+        if (pos == std::string::npos) {
+            fprintf(stderr, "Invalid buft override argument %s\n", value.c_str());
+            return false;
+        }
+        std::string tensor_name = override.substr(0, pos);
+        std::string buffer_type = override.substr(pos + 1);
+        if (buft_list.find(buffer_type) == buft_list.end()) {
+            fprintf(stderr, "Available buffer types:\n");
+            for (const auto & it : buft_list) {
+                fprintf(stderr, "  %s\n", ggml_backend_buft_name(it.second));
+            }
+            return false;
+        }
+        overrides.push_back({strdup(tensor_name.c_str()), buft_list.at(buffer_type)});
+    }
+    return true;
+}
+bool add_cpu_buft_overrides(const char * arg, std::vector<llama_model_tensor_buft_override>& overrides) {
+    int n_layers = std::stoi(arg);
+    if (n_layers < 0) {
+        fprintf(stderr, "error: Invalid value for --n-cpu-moe: %s\n", arg);
+        return false;
+    }
+    for (int32_t l = 0; l < n_layers; ++l) {
+        std::string pattern = "blk\\." + std::to_string(l) + "\\.(ffn_(up|down|gate)_exps\\.weight)";
+        overrides.push_back({strdup(pattern.c_str()), ggml_backend_cpu_buffer_type()});
+    }
+    return true;
+}
+
+template<class T1, class T2>
+std::vector<std::pair<T1,T2>> string_split_pairs(const std::string & str, char delim) {
+    std::vector<std::pair<T1,T2>> values;
+    std::istringstream str_stream(str);
+    std::string token;
+    T1 first_value;
+    int i = 0;
+    while (std::getline(str_stream, token, delim)) {
+        std::istringstream token_stream(token);
+        if (i%2 == 0) {
+            token_stream >> first_value;
+            if (token_stream.fail()) return {};
+        } else {
+            T2 value;
+            token_stream >> value;
+            if (token_stream.fail()) return {};
+            values.emplace_back(first_value, value);
+        }
+        i++;
+    }
+    return values;
+}
+bool operator==(const llama_model_tensor_buft_override & lhs, const llama_model_tensor_buft_override & rhs) {
+    return lhs.buft == rhs.buft &&
+          ((lhs.pattern == nullptr && rhs.pattern == nullptr) || strcmp(lhs.pattern, rhs.pattern) == 0);
+}
+bool operator==(const std::vector<llama_model_tensor_buft_override> & lhs, const std::vector<llama_model_tensor_buft_override> & rhs) {
+    if (lhs.size() != rhs.size()) return false;
+    for (int i = 0; i < int(lhs.size()); ++i) {
+        if (!(lhs[i] == rhs[i])) return false;
+    }
+    return true;
+}
+}
 
 static cmd_params parse_cmd_params(int argc, char ** argv) {
     cmd_params params;
@@ -294,6 +513,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps = cmd_params_defaults.reps;
     params.numa = cmd_params_defaults.numa;
+    params.warmup = cmd_params_defaults.warmup;
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -336,6 +556,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             params.n_pg.push_back({std::stoi(p[0]), std::stoi(p[1])});
+        } else if (arg == "-gp") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<std::string>(argv[i], ',');
+            if (p.size() != 2) {
+                invalid_param = true;
+                break;
+            }
+            params.n_gp.push_back({ std::stoi(p[0]), std::stoi(p[1]) });
         } else if (arg == "-b" || arg == "--batch-size") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -388,7 +619,23 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             auto p = string_split<int>(argv[i], split_delim);
-            params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
+            params.n_threads.reserve(params.n_threads.size() + p.size());
+            for (auto t : p) params.n_threads.push_back({t, t});
+            //params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
+        } else if (arg == "-tgb" || arg == "--threads-gen-batch") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto ps = string_split<std::string>(argv[i], ';');
+            for (auto& s : ps) {
+                auto p = string_split<int>(s.c_str(), ',');
+                if (p.size() != 2) {
+                    invalid_param = true;
+                    break;
+                }
+                params.n_threads.push_back({p[0], p[1]});
+            }
         } else if (arg == "-ngl" || arg == "--n-gpu-layers") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -415,8 +662,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     mode = LLAMA_SPLIT_MODE_NONE;
                 } else if (m == "layer") {
                     mode = LLAMA_SPLIT_MODE_LAYER;
-                } else if (m == "row") {
-                    mode = LLAMA_SPLIT_MODE_ROW;
+                } else if (m == "graph") {
+                    mode = LLAMA_SPLIT_MODE_GRAPH;
                 } else {
                     invalid_param = true;
                     break;
@@ -455,6 +702,34 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             }
             auto p = string_split<bool>(argv[i], split_delim);
             params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
+        } else if (arg == "-mla" || arg == "--mla-attn") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.mla_attn.insert(params.mla_attn.end(), p.begin(), p.end());
+        } else if (arg == "-amb" || arg == "--attn-max-batch") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.attn_max_batch.insert(params.attn_max_batch.end(), p.begin(), p.end());
+        } else if (arg == "-gr" || arg == "--graph-reuse") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<bool>(argv[i], split_delim);
+            params.reuse.insert(params.reuse.end(), p.begin(), p.end());
+        } else if (arg == "-ser" || arg == "--smart-expert-reduction") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split_pairs<int,float>(argv[i], split_delim);
+            params.ser.insert(params.ser.end(), p.begin(), p.end());
         } else if (arg == "-mmp" || arg == "--mmap") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -511,6 +786,123 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             invalid_param = !output_format_from_str(argv[i], params.output_format_stderr);
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+        } else if (arg == "-w" || arg == "--warmup") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.warmup = std::stoi(argv[i]);
+        } else if (arg == "-rtr" || arg == "--run-time-repack") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.repack = std::stoi(argv[i]);
+        } else if (arg == "-cuda" || arg == "--cuda-params") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.cuda_params = argv[i];
+        } else if (arg == "-mqkv" || arg == "--merge-qkv") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.mqkv = std::stoi(argv[i]);
+        } else if (arg == "-muge" || arg == "--merge-up-gate-exps") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.muge = std::stoi(argv[i]);
+        } else if (arg == "--defer-experts") {
+            params.defer_experts = true;
+        } else if (arg == "-sas" || arg == "--scheduler-async") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.sas = std::stoi(argv[i]);
+        } else if (arg == "--fit") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.fit = std::stoi(argv[i]);
+        } else if (arg == "--fit-margin") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.fit_margin = std::stoi(argv[i]);
+        } else if (arg == "--max-gpu") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.max_gpu = std::stoi(argv[i]);
+        } else if (arg == "-rcache" || arg == "--rope-cache") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.rcache = std::stoi(argv[i]);
+        } else if (arg == "-thp" || arg == "--transparent-huge-pages") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.use_thp = std::stoi(argv[i]);
+        } else if (arg == "-fmoe" || arg == "--fused-moe") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.fmoe = std::stoi(argv[i]);
+        } else if (arg == "-ger" || arg == "--grouped-expert-routing") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.ger = std::stoi(argv[i]);
+        } else if (arg == "-no-fug" || arg == "--no-fused-up-gate") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.no_fug = std::stoi(argv[i]);
+        } else if (arg == "-no-ooae" || arg == "--no-offload-only-active-experts") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.no_ooae = std::stoi(argv[i]);
+        } else if (arg == "-ot" || arg == "--override-tensor") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            if (!parse_buft_overrides(std::string{argv[i]}, params.buft_overrides)) {
+                fprintf(stderr, "error: Invalid tensor buffer type override: %s\n", argv[i]);
+                invalid_param = true;
+                break;
+            }
+        } else if (arg == "--n-cpu-moe") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            if (!add_cpu_buft_overrides(argv[i], params.buft_overrides)) {
+                invalid_param = true;
+                break;
+            }
+        } else if (arg == "--print-overrides") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.print_overrides = std::stoi(argv[i]);
         } else {
             invalid_param = true;
             break;
@@ -527,6 +919,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_prompt.empty())     { params.n_prompt = cmd_params_defaults.n_prompt; }
     if (params.n_gen.empty())        { params.n_gen = cmd_params_defaults.n_gen; }
     if (params.n_pg.empty())         { params.n_pg = cmd_params_defaults.n_pg; }
+    if (params.n_gp.empty())         { params.n_gp = cmd_params_defaults.n_gp; }
     if (params.n_batch.empty())      { params.n_batch = cmd_params_defaults.n_batch; }
     if (params.n_ubatch.empty())     { params.n_ubatch = cmd_params_defaults.n_ubatch; }
     if (params.type_k.empty())       { params.type_k = cmd_params_defaults.type_k; }
@@ -537,15 +930,32 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.main_gpu.empty())     { params.main_gpu = cmd_params_defaults.main_gpu; }
     if (params.no_kv_offload.empty()){ params.no_kv_offload = cmd_params_defaults.no_kv_offload; }
     if (params.flash_attn.empty())   { params.flash_attn = cmd_params_defaults.flash_attn; }
+    if (params.mla_attn.empty())     { params.mla_attn = cmd_params_defaults.mla_attn; }
+    if (params.attn_max_batch.empty()){ params.attn_max_batch = cmd_params_defaults.attn_max_batch; }
+    if (params.reuse.empty())        { params.reuse = cmd_params_defaults.reuse; }
+    if (params.ser.empty())          { params.ser = cmd_params_defaults.ser; }
     if (params.tensor_split.empty()) { params.tensor_split = cmd_params_defaults.tensor_split; }
     if (params.use_mmap.empty())     { params.use_mmap = cmd_params_defaults.use_mmap; }
     if (params.embeddings.empty())   { params.embeddings = cmd_params_defaults.embeddings; }
     if (params.n_threads.empty())    { params.n_threads = cmd_params_defaults.n_threads; }
+    if (!params.buft_overrides.empty()) params.buft_overrides.emplace_back(llama_model_tensor_buft_override{nullptr, nullptr});
 
     return params;
 }
 
+enum test_kind_type {
+    // measure mean prompt processing rate without token generation
+    TEST_KIND_PP,
+    // measure mean token generation rate without prompt processing
+    TEST_KIND_TG,
+    // measure mean prompt processing and token generation rate
+    TEST_KIND_PG,
+    // measure mean token generation rate after processing prompt of given length
+    TEST_KIND_GP,
+};
+
 struct cmd_params_instance {
+    test_kind_type test_kind;
     std::string model;
     int n_prompt;
     int n_gen;
@@ -553,16 +963,36 @@ struct cmd_params_instance {
     int n_ubatch;
     ggml_type type_k;
     ggml_type type_v;
-    int n_threads;
+    std::pair<int,int> n_threads;
     int n_gpu_layers;
     std::string rpc_servers;
     llama_split_mode split_mode;
     int main_gpu;
     bool no_kv_offload;
     bool flash_attn;
+    int  mla_attn;
+    int  attn_max_batch;
+    bool reuse;
+    Ser  ser;
     std::vector<float> tensor_split;
+    std::string cuda_params;
     bool use_mmap;
     bool embeddings;
+    bool repack = false;
+    bool fmoe = true;
+    bool ger = false;
+    bool no_fug = false;
+    bool use_thp = false;
+    bool no_ooae = false;
+    bool mqkv = false;
+    bool muge = false;
+    bool defer_experts = false;
+    bool rcache = false;
+    bool sas = false;
+    int max_gpu = 0;
+    bool fit = false;
+    int  fit_margin = 0;
+    const llama_model_tensor_buft_override* buft_overrides;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -575,6 +1005,18 @@ struct cmd_params_instance {
         mparams.main_gpu = main_gpu;
         mparams.tensor_split = tensor_split.data();
         mparams.use_mmap = use_mmap;
+        mparams.repack_tensors = repack;
+        mparams.use_thp = use_thp;
+        mparams.merge_qkv = mqkv;
+        mparams.merge_up_gate_exps = muge;
+        mparams.defer_experts = defer_experts;
+        mparams.tensor_buft_overrides = buft_overrides;
+        mparams.mla = mla_attn;
+        mparams.max_gpu = max_gpu;
+        mparams.fit = fit;
+        mparams.fit_margin = fit_margin;
+        mparams.type_k = type_k;
+        mparams.type_v = type_v;
 
         return mparams;
     }
@@ -586,6 +1028,15 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu &&
                use_mmap == other.use_mmap &&
+               repack == other.repack &&
+               mqkv == other.mqkv &&
+               muge == other.muge &&
+               defer_experts == other.defer_experts &&
+               use_thp == other.use_thp &&
+               sas == other.sas &&
+               fit == other.fit &&
+               fit_margin == other.fit_margin &&
+               max_gpu == other.max_gpu &&
                tensor_split == other.tensor_split;
     }
 
@@ -599,7 +1050,19 @@ struct cmd_params_instance {
         cparams.type_v = type_v;
         cparams.offload_kqv = !no_kv_offload;
         cparams.flash_attn = flash_attn;
+        cparams.mla_attn = mla_attn;
+        cparams.attn_max_batch = attn_max_batch;
+        cparams.graph_reuse = reuse;
+        cparams.fused_moe_up_gate = fmoe;
+        cparams.grouped_expert_routing = ger;
+        cparams.rope_cache = rcache;
+        cparams.fused_up_gate = !no_fug;
+        cparams.only_active_experts = !no_ooae;
+        cparams.min_experts = ser.first;
+        cparams.thresh_experts = ser.second;
         cparams.embeddings = embeddings;
+        cparams.cuda_params = (void *)cuda_params.data();
+        cparams.scheduler_async = sas;
 
         return cparams;
     }
@@ -623,12 +1086,17 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
+    for (const auto & mla : params.mla_attn)
+    for (const auto & amb : params.attn_max_batch)
+    for (const auto & reuse : params.reuse)
+    for (const auto & ser : params.ser)
     for (const auto & nt : params.n_threads) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
             }
             cmd_params_instance instance = {
+                /* .test_kind    = */ TEST_KIND_PP,
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_prompt,
                 /* .n_gen        = */ 0,
@@ -643,9 +1111,29 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .mla_attn     = */ mla,
+                /* .attn_max_b   = */ amb,
+                /* .reuse        = */ reuse,
+                /* .ser          = */ ser,
                 /* .tensor_split = */ ts,
+                /* .cuda_params  = */ params.cuda_params,
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
+                /* .repack       = */ params.repack,
+                /* .fmoe         = */ params.fmoe,
+                /* .ger          = */ params.ger,
+                /* .no_fug       = */ params.no_fug,
+                /* .use_thp      = */ params.use_thp,
+                /* .no_ooae      = */ params.no_ooae,
+                /* .mqkv         = */ params.mqkv,
+                /* .muge         = */ params.muge,
+                /* .defer_experts= */ params.defer_experts,
+                /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
+                /* .max_gpu      = */ params.max_gpu,
+                /* .fit          = */ params.fit,
+                /* .git_margin   = */ params.fit_margin,
+                /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
         }
@@ -655,6 +1143,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
+                /* .test_kind    = */ TEST_KIND_TG,
                 /* .model        = */ m,
                 /* .n_prompt     = */ 0,
                 /* .n_gen        = */ n_gen,
@@ -669,9 +1158,29 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .mla_attn     = */ mla,
+                /* .attn_max_b   = */ amb,
+                /* .reuse        = */ reuse,
+                /* .ser          = */ ser,
                 /* .tensor_split = */ ts,
+                /* .cuda_params  = */ params.cuda_params,
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
+                /* .repack       = */ params.repack,
+                /* .fmoe         = */ params.fmoe,
+                /* .ger          = */ params.ger,
+                /* .no_fug       = */ params.no_fug,
+                /* .use_thp      = */ params.use_thp,
+                /* .no_ooae      = */ params.no_ooae,
+                /* .mqkv         = */ params.mqkv,
+                /* .muge         = */ params.muge,
+                /* .defer_experts= */ params.defer_experts,
+                /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
+                /* .max_gpu      = */ params.max_gpu,
+                /* .fit          = */ params.fit,
+                /* .git_margin   = */ params.fit_margin,
+                /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
         }
@@ -681,6 +1190,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
+                /* .test_kind    = */ TEST_KIND_PG,
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_pg.first,
                 /* .n_gen        = */ n_pg.second,
@@ -695,9 +1205,76 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .mla_attn     = */ mla,
+                /* .attn_max_b   = */ amb,
+                /* .reuse        = */ reuse,
+                /* .ser          = */ ser,
                 /* .tensor_split = */ ts,
+                /* .cuda_params  = */ params.cuda_params,
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
+                /* .repack       = */ params.repack,
+                /* .fmoe         = */ params.fmoe,
+                /* .ger          = */ params.ger,
+                /* .no_fug       = */ params.no_fug,
+                /* .use_thp      = */ params.use_thp,
+                /* .no_ooae      = */ params.no_ooae,
+                /* .mqkv         = */ params.mqkv,
+                /* .muge         = */ params.muge,
+                /* .defer_experts= */ params.defer_experts,
+                /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
+                /* .max_gpu      = */ params.max_gpu,
+                /* .fit          = */ params.fit,
+                /* .git_margin   = */ params.fit_margin,
+                /* .buft_overrides=*/ params.buft_overrides.data(),
+            };
+            instances.push_back(instance);
+        }
+
+        for (const auto & n_gp : params.n_gp) {
+            if (n_gp.first == 0 && n_gp.second == 0) {
+                continue;
+            }
+            cmd_params_instance instance = {
+                /* .test_kind    = */ TEST_KIND_GP,
+                /* .model        = */ m,
+                /* .n_prompt     = */ n_gp.first,
+                /* .n_gen        = */ n_gp.second,
+                /* .n_batch      = */ nb,
+                /* .n_ubatch     = */ nub,
+                /* .type_k       = */ tk,
+                /* .type_v       = */ tv,
+                /* .n_threads    = */ nt,
+                /* .n_gpu_layers = */ nl,
+                /* .rpc_servers  = */ rpc,
+                /* .split_mode   = */ sm,
+                /* .main_gpu     = */ mg,
+                /* .no_kv_offload= */ nkvo,
+                /* .flash_attn   = */ fa,
+                /* .mla_attn     = */ mla,
+                /* .attn_max_b   = */ amb,
+                /* .reuse        = */ reuse,
+                /* .ser          = */ ser,
+                /* .tensor_split = */ ts,
+                /* .cuda_params  = */ params.cuda_params,
+                /* .use_mmap     = */ mmp,
+                /* .embeddings   = */ embd,
+                /* .repack       = */ params.repack,
+                /* .fmoe         = */ params.fmoe,
+                /* .ger          = */ params.ger,
+                /* .no_fug       = */ params.no_fug,
+                /* .use_thp      = */ params.use_thp,
+                /* .no_ooae      = */ params.no_ooae,
+                /* .mqkv         = */ params.mqkv,
+                /* .muge         = */ params.muge,
+                /* .defer_experts= */ params.defer_experts,
+                /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
+                /* .max_gpu      = */ params.max_gpu,
+                /* .fit          = */ params.fit,
+                /* .git_margin   = */ params.fit_margin,
+                /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
         }
@@ -724,7 +1301,7 @@ struct test {
     uint64_t model_n_params;
     int n_batch;
     int n_ubatch;
-    int n_threads;
+    std::pair<int,int> n_threads;
     bool has_rpc;
     ggml_type type_k;
     ggml_type type_v;
@@ -733,13 +1310,35 @@ struct test {
     int main_gpu;
     bool no_kv_offload;
     bool flash_attn;
+    int  mla_attn;
+    int  attn_max_batch;
+    bool reuse;
+    Ser  ser;
     std::vector<float> tensor_split;
+    std::string cuda_params;
     bool use_mmap;
     bool embeddings;
+    bool repack = false;
+    bool fmoe = false;
+    bool ger = false;
+    bool no_fug = false;
+    bool use_thp = false;
+    bool no_ooae = false;
+    bool mqkv = false;
+    bool muge = false;
+    bool defer_experts = false;
+    bool rcache = false;
+    bool sas = false;
+    bool max_gpu = 0;
+    bool fit = false;
+    int  fit_margin = 0;
+    std::string override_tensor;
     int n_prompt;
     int n_gen;
     std::string test_time;
     std::vector<uint64_t> samples_ns;
+    test_kind_type  test_kind;
+    std::string     test_label;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) {
         model_filename = inst.model;
@@ -759,15 +1358,68 @@ struct test {
         main_gpu = inst.main_gpu;
         no_kv_offload = inst.no_kv_offload;
         flash_attn = inst.flash_attn;
+        mla_attn = inst.mla_attn;
+        attn_max_batch = inst.attn_max_batch;
+        reuse = inst.reuse;
+        ser = inst.ser;
         tensor_split = inst.tensor_split;
+        cuda_params = inst.cuda_params;
         use_mmap = inst.use_mmap;
         embeddings = inst.embeddings;
+        repack = inst.repack;
+        mqkv = inst.mqkv;
+        muge = inst.muge;
+        defer_experts = inst.defer_experts;
+        fmoe = inst.fmoe;
+        ger = inst.ger;
+        rcache = inst.rcache;
+        sas = inst.sas;
+        max_gpu = inst.max_gpu;
+        fit = inst.fit;
+        fit_margin = inst.fit_margin;
+        no_fug = inst.no_fug;
+        use_thp = inst.use_thp;
+        no_ooae = inst.no_ooae;
+        if (inst.buft_overrides) {
+            const auto * bo = inst.buft_overrides;
+            while (bo->pattern) {
+                if (!override_tensor.empty()) {
+                    override_tensor += ",";
+                }
+                override_tensor += bo->pattern;
+                override_tensor += "=";
+                override_tensor += ggml_backend_buft_name(bo->buft);
+                ++bo;
+            }
+        }
+
         n_prompt = inst.n_prompt;
         n_gen = inst.n_gen;
+        test_kind = inst.test_kind;
         // RFC 3339 date-time format
         time_t t = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
         test_time = buf;
+
+        // prepare test label for printing
+        switch (test_kind) {
+            case TEST_KIND_PP:
+                snprintf(buf, sizeof(buf), "pp%d", n_prompt);
+                break;
+            case TEST_KIND_TG:
+                snprintf(buf, sizeof(buf), "tg%d", n_gen);
+                break;
+            case TEST_KIND_PG:
+                snprintf(buf, sizeof(buf), "pp%d+tg%d", n_prompt, n_gen);
+                break;
+            case TEST_KIND_GP:
+                snprintf(buf, sizeof(buf), "tg%d@pp%d", n_gen, n_prompt);
+                break;
+            default:
+                snprintf(buf, sizeof(buf), "unknown");
+                break;
+        }
+        test_label = buf;
 
         (void) ctx;
     }
@@ -781,7 +1433,7 @@ struct test {
     }
 
     std::vector<double> get_ts() const {
-        int n_tokens = n_prompt + n_gen;
+        int n_tokens = (test_kind == TEST_KIND_GP ? 0 : n_prompt) + n_gen;
         std::vector<double> ts;
         std::transform(samples_ns.begin(), samples_ns.end(), std::back_inserter(ts), [n_tokens](uint64_t t) { return 1e9 * n_tokens / t; });
         return ts;
@@ -821,24 +1473,6 @@ struct test {
         return "CPU";
     }
 
-    static const std::vector<std::string> & get_fields() {
-        static const std::vector<std::string> fields = {
-            "build_commit", "build_number",
-            "cuda", "vulkan", "kompute", "metal", "sycl", "rpc", "gpu_blas", "blas",
-            "cpu_info", "gpu_info",
-            "model_filename", "model_type", "model_size", "model_n_params",
-            "n_batch", "n_ubatch",
-            "n_threads", "type_k", "type_v",
-            "n_gpu_layers", "split_mode",
-            "main_gpu", "no_kv_offload", "flash_attn",
-            "tensor_split", "use_mmap", "embeddings",
-            "n_prompt", "n_gen", "test_time",
-            "avg_ns", "stddev_ns",
-            "avg_ts", "stddev_ts"
-        };
-        return fields;
-    }
-
     enum field_type {STRING, BOOL, INT, FLOAT};
 
     static field_type get_field_type(const std::string & field) {
@@ -846,13 +1480,15 @@ struct test {
             field == "n_threads" ||
             field == "model_size" || field == "model_n_params" ||
             field == "n_gpu_layers" || field == "main_gpu" ||
-            field == "n_prompt" || field == "n_gen" ||
-            field == "avg_ns" || field == "stddev_ns") {
+            field == "n_prompt" || field == "n_gen" || field == "mla_attn" || field == "attn_max_batch" ||
+            field == "avg_ns" || field == "stddev_ns" || field == "max_gpu") {
             return INT;
         }
         if (field == "cuda" || field == "vulkan" || field == "kompute" || field == "metal" ||
-            field == "gpu_blas" || field == "blas" || field == "sycl" ||field == "f16_kv" || field == "no_kv_offload" ||
-            field == "flash_attn" || field == "use_mmap" || field == "embeddings") {
+            field == "gpu_blas" || field == "blas" || field == "sycl" || field == "no_kv_offload" ||
+            field == "flash_attn" || field == "use_mmap" || field == "embeddings" || field == "repack" || field == "use_thp" ||
+            field == "fused_moe" || field == "grouped_er" || field == "no_fused_up_gate" || field == "no_ooae" || field == "mqkv" ||
+            field == "rcache" || field == "reuse" || field == "muge" || field == "defer_experts" || field == "sas") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -877,22 +1513,53 @@ struct test {
                 tensor_split_str += "/";
             }
         }
+        auto ser_to_string = [] (const Ser& ser) {
+            std::ostringstream str;
+            str << ser.first << ',' << ser.second;
+            return str.str();
+        };
+        bool is_gen = n_gen > 0;
         std::vector<std::string> values = {
             build_commit, std::to_string(build_number),
-            std::to_string(cuda), std::to_string(vulkan), std::to_string(vulkan),
+            std::to_string(cuda), std::to_string(vulkan), std::to_string(kompute),
             std::to_string(metal), std::to_string(sycl), std::to_string(has_rpc), std::to_string(gpu_blas), std::to_string(blas),
             cpu_info, gpu_info,
             model_filename, model_type, std::to_string(model_size), std::to_string(model_n_params),
             std::to_string(n_batch), std::to_string(n_ubatch),
-            std::to_string(n_threads), ggml_type_name(type_k), ggml_type_name(type_v),
+            std::to_string(is_gen ? n_threads.first : n_threads.second), ggml_type_name(type_k), ggml_type_name(type_v),
             std::to_string(n_gpu_layers), split_mode_str(split_mode),
             std::to_string(main_gpu), std::to_string(no_kv_offload), std::to_string(flash_attn),
+            std::to_string(mla_attn), std::to_string(attn_max_batch), ser_to_string(ser), std::to_string(reuse),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
+            std::to_string(repack), std::to_string(mqkv), std::to_string(muge), std::to_string(defer_experts), std::to_string(fmoe), std::to_string(ger),
+            std::to_string(no_fug), std::to_string(use_thp), std::to_string(no_ooae), std::to_string(rcache), std::to_string(sas),
+            std::to_string(max_gpu),
+            cuda_params, override_tensor,
             std::to_string(n_prompt), std::to_string(n_gen), test_time,
             std::to_string(avg_ns()), std::to_string(stdev_ns()),
-            std::to_string(avg_ts()), std::to_string(stdev_ts())
+            std::to_string(avg_ts()), std::to_string(stdev_ts()),
+            test_label
         };
         return values;
+    }
+
+    static const std::vector<std::string> & get_fields() {
+        static const std::vector<std::string> fields = {
+            "build_commit", "build_number",
+            "cuda", "vulkan", "kompute", "metal", "sycl", "rpc", "gpu_blas", "blas",
+            "cpu_info", "gpu_info",
+            "model_filename", "model_type", "model_size", "model_n_params",
+            "n_batch", "n_ubatch",
+            "n_threads", "type_k", "type_v",
+            "n_gpu_layers", "split_mode",
+            "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
+            "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "defer_experts", "fused_moe", "grouped_er",
+            "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "sas", "max_gpu", "cuda_params", "override_tensor",
+            "n_prompt", "n_gen", "test_time",
+            "avg_ns", "stddev_ns",
+            "avg_ts", "stddev_ts", "test",
+        };
+        return fields;
     }
 
     std::map<std::string, std::string> get_map() const {
@@ -1017,6 +1684,7 @@ struct json_printer : public printer {
 
 struct markdown_printer : public printer {
     std::vector<std::string> fields;
+    bool skipped_overrides = false;
 
     static int get_field_width(const std::string & field) {
         if (field == "model") {
@@ -1049,8 +1717,56 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return 2;
         }
+        if (field == "mla_attn") {
+            return 3;
+        }
+        if (field == "attn_max_batch") {
+            return 5;
+        }
+        if (field == "reuse") {
+            return 2;
+        }
+        if (field == "ser") {
+            return 10;
+        }
         if (field == "use_mmap") {
             return 4;
+        }
+        if (field == "repack") {
+            return 3;
+        }
+        if (field == "mqkv") {
+            return 4;
+        }
+        if (field == "muge") {
+            return 4;
+        }
+        if (field == "defer_experts") {
+            return 5;
+        }
+        if (field == "sas") {
+            return 3;
+        }
+        if (field == "max_gpu") {
+            return 7;
+        }
+        if (field == "use_thp") {
+            return 3;
+        }
+        if (field == "fused_moe") {
+            return 4;
+        }
+        if (field == "grouped_er") {
+            return 3;
+        }
+        if (field == "rcache") {
+            return 6;
+        }
+        if (field == "no_fused_up_gate") {
+            return 6;
+        }
+        if (field == "no_ooae") {
+            return 7;
         }
         if (field == "test") {
             return 13;
@@ -1080,14 +1796,68 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return "fa";
         }
+        if (field == "mla_attn") {
+            return "mla";
+        }
+        if (field == "attn_max_batch") {
+            return "amb";
+        }
+        if (field == "reuse") {
+            return "gr";
+        }
+        if (field == "ser") {
+            return "ser";
+        }
         if (field == "use_mmap") {
             return "mmap";
+        }
+        if (field == "repack") {
+            return "rtr";
+        }
+        if (field == "mqkv") {
+            return "mqkv";
+        }
+        if (field == "muge") {
+            return "muge";
+        }
+        if (field == "defer_experts") {
+            return "defer";
+        }
+        if (field == "sas") {
+            return "sas";
+        }
+        if (field == "max_gpu") {
+            return "max_gpu";
+        }
+        if (field == "use_thp") {
+            return "thp";
+        }
+        if (field == "fused_moe") {
+            return "fmoe";
+        }
+        if (field == "grouped_er") {
+            return "ger";
+        }
+        if (field == "rcache") {
+            return "rcache";
+        }
+        if (field == "no_fused_up_gate") {
+            return "no-fug";
+        }
+        if (field == "no_ooae") {
+            return "no-ooae";
         }
         if (field == "embeddings") {
             return "embd";
         }
         if (field == "tensor_split") {
             return "ts";
+        }
+        if (field == "cuda_params") {
+            return "cuda";
+        }
+        if (field == "override_tensor") {
+            return "ot";
         }
         return field;
     }
@@ -1129,6 +1899,18 @@ struct markdown_printer : public printer {
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
         }
+        if (params.mla_attn.size() > 1 || params.mla_attn != cmd_params_defaults.mla_attn) {
+            fields.emplace_back("mla_attn");
+        }
+        if (params.attn_max_batch.size() > 1 || params.attn_max_batch != cmd_params_defaults.attn_max_batch) {
+            fields.emplace_back("attn_max_batch");
+        }
+        if (params.reuse.size() > 1 || params.reuse != cmd_params_defaults.reuse) {
+            fields.emplace_back("reuse");
+        }
+        if (params.ser.size() > 1 || params.ser != cmd_params_defaults.ser) {
+            fields.emplace_back("ser");
+        }
         if (params.tensor_split.size() > 1 || params.tensor_split != cmd_params_defaults.tensor_split) {
             fields.emplace_back("tensor_split");
         }
@@ -1137,6 +1919,52 @@ struct markdown_printer : public printer {
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
+        }
+        if (params.cuda_params != cmd_params_defaults.cuda_params) {
+            fields.emplace_back("cuda_params");
+        }
+        if (!(params.buft_overrides == cmd_params_defaults.buft_overrides)) {
+            if (params.print_overrides) {
+                fields.emplace_back("override_tensor");
+            } else {
+                skipped_overrides = true;
+            }
+        }
+        if (params.repack != cmd_params_defaults.repack) {
+            fields.emplace_back("repack");
+        }
+        if (params.mqkv != cmd_params_defaults.mqkv) {
+            fields.emplace_back("mqkv");
+        }
+        if (params.sas != cmd_params_defaults.sas) {
+            fields.emplace_back("sas");
+        }
+        if (params.max_gpu != cmd_params_defaults.max_gpu) {
+            fields.emplace_back("max_gpu");
+        }
+        if (params.muge != cmd_params_defaults.muge) {
+            fields.emplace_back("muge");
+        }
+        if (params.defer_experts != cmd_params_defaults.defer_experts) {
+            fields.emplace_back("defer_experts");
+        }
+        if (params.use_thp != cmd_params_defaults.use_thp) {
+            fields.emplace_back("use_thp");
+        }
+        if (params.fmoe != cmd_params_defaults.fmoe) {
+            fields.emplace_back("fused_moe");
+        }
+        if (params.ger != cmd_params_defaults.ger) {
+            fields.emplace_back("grouped_er");
+        }
+        if (params.rcache != cmd_params_defaults.rcache) {
+            fields.emplace_back("rcache");
+        }
+        if (params.no_fug != cmd_params_defaults.no_fug) {
+            fields.emplace_back("no_fused_up_gate");
+        }
+        if (params.no_ooae != cmd_params_defaults.no_ooae) {
+            fields.emplace_back("no_ooae");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
@@ -1159,6 +1987,9 @@ struct markdown_printer : public printer {
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
+            if (skipped_overrides && field == "override_tensor") {
+                continue;
+            }
             std::string value;
             char buf[128];
             if (field == "model") {
@@ -1183,14 +2014,15 @@ struct markdown_printer : public printer {
                     value += "+RPC";
                 }
             } else if (field == "test") {
-                if (t.n_prompt > 0 && t.n_gen == 0) {
-                    snprintf(buf, sizeof(buf), "pp%d", t.n_prompt);
-                } else if (t.n_gen > 0 && t.n_prompt == 0) {
-                    snprintf(buf, sizeof(buf), "tg%d", t.n_gen);
-                } else {
-                    snprintf(buf, sizeof(buf), "pp%d+tg%d", t.n_prompt, t.n_gen);
-                }
-                value = buf;
+                //if (t.n_prompt > 0 && t.n_gen == 0) {
+                //    snprintf(buf, sizeof(buf), "pp%d", t.n_prompt);
+                //} else if (t.n_gen > 0 && t.n_prompt == 0) {
+                //    snprintf(buf, sizeof(buf), "tg%d", t.n_gen);
+                //} else {
+                //    snprintf(buf, sizeof(buf), "pp%d+tg%d", t.n_prompt, t.n_gen);
+                //}
+                //value = buf;
+                value = t.test_label;
             } else if (field == "t/s") {
                 snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
                 value = buf;
@@ -1217,6 +2049,17 @@ struct markdown_printer : public printer {
 };
 
 struct sql_printer : public printer {
+    static std::string escape_sql(const std::string & value) {
+        std::string escaped;
+        for (auto c : value) {
+            if (c == '\'') {
+                escaped += "''";
+            } else {
+                escaped += c;
+            }
+        }
+        return escaped;
+    }
     static std::string get_sql_field_type(const std::string & field) {
         switch (test::get_field_type(field)) {
             case test::STRING:
@@ -1247,6 +2090,7 @@ struct sql_printer : public printer {
         fprintf(fout, "INSERT INTO test (%s) ", join(test::get_fields(), ", ").c_str());
         fprintf(fout, "VALUES (");
         std::vector<std::string> values = t.get_values();
+        std::transform(values.begin(), values.end(), values.begin(), escape_sql);
         for (size_t i = 0; i < values.size(); i++) {
             fprintf(fout, "'%s'%s", values.at(i).c_str(), i < values.size() - 1 ? ", " : "");
         }
@@ -1311,7 +2155,7 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
         case SQL:
             return std::unique_ptr<printer>(new sql_printer());
     }
-    GGML_ASSERT(false);
+    GGML_ABORT("fatal error");
 }
 
 int main(int argc, char ** argv) {
@@ -1365,7 +2209,7 @@ int main(int argc, char ** argv) {
                 llama_free_model(lmodel);
             }
 
-            lmodel = llama_load_model_from_file(inst.model.c_str(), inst.to_llama_mparams());
+            lmodel = llama_model_load_from_file(inst.model.c_str(), inst.to_llama_mparams());
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
@@ -1373,7 +2217,7 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_new_context_with_model(lmodel, inst.to_llama_cparams());
+        llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_free_model(lmodel);
@@ -1385,12 +2229,14 @@ int main(int argc, char ** argv) {
         llama_kv_cache_clear(ctx);
 
         // warmup run
-        if (t.n_prompt > 0) {
-            //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-            test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads);
-        }
-        if (t.n_gen > 0) {
-            test_gen(ctx, 1, 0, t.n_threads);
+        if (params.warmup) {
+            if (t.n_prompt > 0) {
+                //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
+                test_prompt(ctx, 1, 0, t.n_batch, t.n_threads.second);
+            }
+            if (t.n_gen > 0) {
+                test_gen(ctx, 1, 0, t.n_threads.first);
+            }
         }
 
         for (int i = 0; i < params.reps; i++) {
@@ -1399,10 +2245,11 @@ int main(int argc, char ** argv) {
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
-                test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads);
+                test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads.second);
             }
+            if (t.test_kind == TEST_KIND_GP) t_start = get_time_ns();
             if (t.n_gen > 0) {
-                test_gen(ctx, t.n_gen, t.n_prompt, t.n_threads);
+                test_gen(ctx, t.n_gen, t.n_prompt, t.n_threads.first);
             }
 
             uint64_t t_ns = get_time_ns() - t_start;
