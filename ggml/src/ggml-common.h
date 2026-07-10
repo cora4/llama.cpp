@@ -209,6 +209,18 @@ typedef struct {
 } block_q4_0x4;
 static_assert(sizeof(block_q4_0x4) == 4 * sizeof(ggml_half) + QK4_0 * 2, "wrong q4_0x4 block size/padding");
 
+
+typedef struct {
+    ggml_half d[8];
+    int8_t qs[4*QK8_1];
+} block_q8_1_x4;
+static_assert(sizeof(block_q8_1_x4) == 4*sizeof(block_q8_1), "wrong q8_1_x4 block size/padding");
+typedef struct {
+    ggml_half d[4];
+    int8_t qs[4*QK8_0];
+} block_q8_0_x4;
+static_assert(sizeof(block_q8_0_x4) == 4*sizeof(block_q8_0), "wrong q8_0_x4 block size/padding");
+
 typedef struct {
     ggml_half d[8];        // deltas for 8 q4_0 blocks
     uint8_t qs[QK4_0 * 4]; // nibbles / quants for 8 q4_0 blocks
@@ -315,6 +327,17 @@ typedef struct {
 } block_q8_K;
 static_assert(sizeof(block_q8_K) == sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
 
+typedef struct {
+    float   d;              // delta
+    int8_t  qs[64];       // quants
+} block_q8_K64;
+static_assert(sizeof(block_q8_K64) == sizeof(float) + 64, "wrong q8_K64 block size/padding");
+typedef struct {
+    float   d;              // delta
+    int8_t  qs[128];        // quants
+} block_q8_K128;
+static_assert(sizeof(block_q8_K128) == sizeof(float) + 128, "wrong q8_K128 block size/padding");
+
 // (Almost) "true" 2-bit quantization.
 // Due to the need to use blocks as per ggml design, it ends up using
 // 2.0625 bpw because of the 16-bit scale for each block of 256.
@@ -397,6 +420,16 @@ typedef struct {
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
+
+
+typedef struct {
+    ggml_half d;
+    uint16_t extra;
+    uint8_t  scales_h[QK_K/64];
+    uint8_t  scales_l[QK_K/32];
+    uint8_t  qs[QK_K/2];
+} block_iq4_k;
+static_assert(sizeof(block_iq4_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/2 + 3*QK_K/64, "wrong iq4_k block size/padding");
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
@@ -1828,6 +1861,11 @@ GGML_TABLE_BEGIN(uint32_t, iq1s_grid_gpu, NGRID_IQ1S)
     0x22202022, 0x22202220, 0x22202222, 0x22212121, 0x22222020, 0x22222022, 0x22222220, 0x22222222,
 GGML_TABLE_END()
 #endif
+
+GGML_TABLE_BEGIN(int8_t, iq4k_values, 32)
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117
+GGML_TABLE_END()
 
 #endif // GGML_COMMON_IMPL
 #endif // GGML_COMMON_IMPL

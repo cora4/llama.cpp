@@ -4,6 +4,9 @@
 #include "ggml-quants.h"
 #include "ggml-impl.h"
 
+#if GGML_USE_IQK_MULMAT
+#include "iqk/iqk_mul_mat.h"
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -870,6 +873,12 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
 
     block_q8_0 * restrict y = vy;
 
+#if GGML_USE_IQK_MULMAT
+    const int nb4 = 4*(nb/4);
+#else
+    const int nb4 = -1;
+#endif
+
 #if defined(__ARM_NEON)
     for (int i = 0; i < nb; i++) {
         float32x4_t srcv [8];
@@ -934,7 +943,18 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
         }
     }
 #elif defined(__AVX2__) || defined(__AVX__)
+
+    block_q8_0_x4 * y4 = (block_q8_0_x4 *)vy;
+#ifdef __AVX2__
+    const bool pack = true;
+#else
+    const bool pack = false;
+#endif
+
     for (int i = 0; i < nb; i++) {
+
+        int i4 = i/4, ir = i%4;
+
         // Load elements into 4 AVX vectors
         __m256 v0 = _mm256_loadu_ps( x );
         __m256 v1 = _mm256_loadu_ps( x + 8 );
@@ -956,7 +976,13 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
 
         // Quantize these floats
         const float d = maxScalar / 127.f;
-        y[i].d = GGML_FP32_TO_FP16(d);
+
+        if (pack && i < nb4) {
+            y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+        } else {
+            y[i].d = GGML_FP32_TO_FP16(d);
+        }
+
         const float id = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
 
@@ -991,7 +1017,11 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
         const __m256i perm = _mm256_setr_epi32( 0, 4, 1, 5, 2, 6, 3, 7 );
         i0 = _mm256_permutevar8x32_epi32( i0, perm );
 
-        _mm256_storeu_si256((__m256i *)y[i].qs, i0);
+        if (i < nb4) {
+            _mm256_storeu_si256((__m256i *)y4[i4].qs + ir, i0);
+        } else {
+            _mm256_storeu_si256((__m256i *)y[i].qs, i0);
+        }
 #else
         // Since we don't have in AVX some necessary functions,
         // we split the registers in half and call AVX2 analogs from SSE
@@ -1190,6 +1220,12 @@ void quantize_row_q8_1(const float * restrict x, void * restrict vy, int64_t k) 
 
     block_q8_1 * restrict y = vy;
 
+#if GGML_USE_IQK_MULMAT
+    const int nb4 = 4*(nb/4);
+#else
+    const int nb4 = -1;
+#endif
+
 #if defined(__ARM_NEON)
     for (int i = 0; i < nb; i++) {
         float32x4_t srcv [8];
@@ -1270,7 +1306,18 @@ void quantize_row_q8_1(const float * restrict x, void * restrict vy, int64_t k) 
                      wasm_i32x4_extract_lane(accv, 3)));
     }
 #elif defined(__AVX2__) || defined(__AVX__)
+
+    block_q8_1_x4 * restrict y4 = vy;
+#ifdef __AVX2__
+    const bool pack = true;
+#else
+    const bool pack = false;
+#endif
+
     for (int i = 0; i < nb; i++) {
+
+        int i4 = i/4, ir = i%4;
+
         // Load elements into 4 AVX vectors
         __m256 v0 = _mm256_loadu_ps( x );
         __m256 v1 = _mm256_loadu_ps( x + 8 );
@@ -1292,7 +1339,13 @@ void quantize_row_q8_1(const float * restrict x, void * restrict vy, int64_t k) 
 
         // Quantize these floats
         const float d = max_scalar / 127.f;
-        y[i].d = GGML_FP32_TO_FP16(d);
+
+        if (pack && i < nb4) {
+            y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+        } else {
+            y[i].d = GGML_FP32_TO_FP16(d);
+        }
+
         const float id = ( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
 
@@ -1316,7 +1369,11 @@ void quantize_row_q8_1(const float * restrict x, void * restrict vy, int64_t k) 
 
 #if defined(__AVX2__)
         // Compute the sum of the quants and set y[i].s
-        y[i].s = GGML_FP32_TO_FP16(d * hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
+        if (i < nb4) {
+            y4[i4].d[ir+4] = GGML_FP32_TO_FP16(d * hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
+        } else {
+            y[i].s = GGML_FP32_TO_FP16(d * hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
+        }
 
         // Convert int32 to int16
         i0 = _mm256_packs_epi32( i0, i1 );	// 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
@@ -1330,7 +1387,12 @@ void quantize_row_q8_1(const float * restrict x, void * restrict vy, int64_t k) 
         const __m256i perm = _mm256_setr_epi32( 0, 4, 1, 5, 2, 6, 3, 7 );
         i0 = _mm256_permutevar8x32_epi32( i0, perm );
 
-        _mm256_storeu_si256((__m256i *)y[i].qs, i0);
+        if (i < nb4) {
+            _mm256_storeu_si256((__m256i *)y4[i4].qs + ir, i0);
+        } else {
+            _mm256_storeu_si256((__m256i *)y[i].qs, i0);
+        }
+
 #else
         // Since we don't have in AVX some necessary functions,
         // we split the registers in half and call AVX2 analogs from SSE
@@ -3727,6 +3789,13 @@ static inline __m128i get_scale_shuffle(int i) {
 #endif
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+
+#if GGML_USE_IQK_MULMAT
+    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q4_0, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
+        return;
+    }
+#endif
+
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -4209,6 +4278,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#if GGML_USE_IQK_MULMAT
+    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q4_1, vx, bx, GGML_TYPE_Q8_1, vy, by, s, bs, 0, 1)) {
+        return;
+    }
+#endif
+
     const int qk = QK8_1;
     const int nb = n / qk;
 
@@ -4496,6 +4571,13 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q5_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+
+#if GGML_USE_IQK_MULMAT
+    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q5_0, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
+        return;
+    }
+#endif
+
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -4851,6 +4933,13 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+
+#if GGML_USE_IQK_MULMAT
+    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q5_1, vx, bx, GGML_TYPE_Q8_1, vy, by, s, bs, 0, 1)) {
+        return;
+    }
+#endif
+
     const int qk = QK8_1;
     const int nb = n / qk;
 
@@ -5225,6 +5314,13 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+
+#if GGML_USE_IQK_MULMAT
+    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q8_0, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
+        return;
+    }
+#endif
+
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -11594,6 +11690,13 @@ void ggml_vec_dot_iq1_m_q8_K  (int n, float * restrict s, size_t bs, const void 
 }
 
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+
+#if GGML_USE_IQK_MULMAT
+    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_IQ4_NL, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
+        return;
+    }
+#endif
+
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -14845,6 +14948,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
+
+        case GGML_TYPE_IQ2_K: break;
+        case GGML_TYPE_IQ3_K: break;
+        case GGML_TYPE_IQ4_K: break;
+        case GGML_TYPE_IQ5_K: break;
+        case GGML_TYPE_IQ6_K: break;
+
         case GGML_TYPE_Q4_0_4_4:
         case GGML_TYPE_Q4_0_4_8:
             {

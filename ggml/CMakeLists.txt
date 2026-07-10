@@ -111,6 +111,7 @@ option(GGML_BLAS                            "ggml: use BLAS"                    
 set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
                                             "ggml: BLAS library vendor")
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             OFF)
+option(GGML_IQK_MUL_MAT                     "ggml: use optimized iqk matrix multiplications"  ON)
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
@@ -167,7 +168,7 @@ set(CMAKE_C_STANDARD_REQUIRED true)
 if (GGML_SYCL)
     set(CMAKE_CXX_STANDARD 17)
 else()
-    set(CMAKE_CXX_STANDARD 11)
+    set(CMAKE_CXX_STANDARD 17)
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED true)
 
