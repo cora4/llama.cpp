@@ -391,6 +391,15 @@ extern "C" {
         GGML_TYPE_Q4_0_4_4 = 31,
         GGML_TYPE_Q4_0_4_8 = 32,
         GGML_TYPE_Q4_0_8_8 = 33,
+        GGML_TYPE_IQ1_BN  = 34,
+        GGML_TYPE_IQ2_BN  = 35,
+        GGML_TYPE_Q8_K64  = 36,
+        GGML_TYPE_IQ2_K   = 37,
+        GGML_TYPE_IQ3_K   = 38,
+        GGML_TYPE_IQ4_K   = 39,
+        GGML_TYPE_IQ5_K   = 40,
+        GGML_TYPE_IQ6_K   = 41,
+        GGML_TYPE_IQ2_TN  = 42,
         GGML_TYPE_COUNT,
     };
 
@@ -435,6 +444,14 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q4_0_4_4 = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_0_4_8 = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_0_8_8 = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_BN  = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ2_BN  = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ2_K   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ3_K   = 31, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ4_K   = 32, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ5_K   = 33, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ6_K   = 34, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ2_TN  = 35, // except 1d tensors
     };
 
     // available tensor operations:
@@ -497,6 +514,7 @@ extern "C" {
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
         GGML_OP_LEAKY_RELU,
+        GGML_OP_SOFTCAP,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -731,6 +749,8 @@ extern "C" {
     GGML_API GGML_CALL const char * ggml_type_name(enum ggml_type type);
     GGML_API GGML_CALL const char * ggml_op_name  (enum ggml_op   op);
     GGML_API           const char * ggml_op_symbol(enum ggml_op   op);
+
+    GGML_API GGML_CALL bool ggml_is_noop(const struct ggml_tensor * tensor);
 
     GGML_API           const char * ggml_unary_op_name(enum ggml_unary_op op);
     GGML_API GGML_CALL const char * ggml_op_desc(const struct ggml_tensor * t); // unary or op name
@@ -1203,6 +1223,19 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 s);
+
+    GGML_API struct ggml_tensor * ggml_softcap(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 s_before,
+            float                 s_after);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_softcap_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 s_before,
+            float                 s_after);
 
     // b -> view(a,offset,nb1,nb2,3), return modified a
     GGML_API struct ggml_tensor * ggml_set(
