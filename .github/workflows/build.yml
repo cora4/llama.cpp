@@ -59,7 +59,7 @@ jobs:
           source /opt/intel/oneapi/setvars.sh
           mkdir build
           cd build
-          cmake -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ..
+          cmake -DLLAMA_SYCL=ON -DLLAMA_SYCL_F16 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ..
           cmake --build . --config Release -j $(nproc)
           zip -r9XD /tmp/llama-latest-bin-ubuntu-sycl.zip *
 
