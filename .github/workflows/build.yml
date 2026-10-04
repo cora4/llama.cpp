@@ -67,11 +67,11 @@ jobs:
           source /opt/intel/oneapi/setvars.sh
           mkdir build
           cd build
-          cmake -DLLAMA_SYCL=ON -DLLAMA_SYCL_F16=OFF \
+          cmake -DLLAMA_SYCL=ON -DLLAMA_SYCL_F16=ON -DLLAMA_NATIVE=OFF \
           -DCMAKE_C_COMPILER=icx \
-          "-DCMAKE_C_FLAGS=-march=tigerlake -mno-avxvnni" \
+          "-DCMAKE_C_FLAGS=-march=tigerlake -mno-avxvnni -fp-model=precise" \
           -DCMAKE_CXX_COMPILER=icpx \
-          "-DCMAKE_CXX_FLAGS=-march=tigerlake -mno-avxvnni" ..
+          "-DCMAKE_CXX_FLAGS=-march=tigerlake -mno-avxvnni -fp-model=precise" ..
           cmake --build . --config Release -j $(nproc)
           zip -r9XD /tmp/llama-latest-bin-ubuntu-sycl.zip *
 
