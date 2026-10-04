@@ -73,6 +73,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=icpx \
           "-DCMAKE_CXX_FLAGS=-march=tigerlake -mno-avxvnni -fp-model=precise" ..
           cmake --build . --config Release -j $(nproc)
+          cd bin/
           zip -r9XD /tmp/llama-latest-bin-ubuntu-sycl.zip *
 
       - name: Upload Build Artifact
@@ -80,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: llama-latest-bin-ubuntu-sycl
-          path: build/
+          path: build/bin/
 
       - name: Create Release
         run: |
