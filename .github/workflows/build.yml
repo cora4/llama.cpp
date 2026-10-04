@@ -65,7 +65,7 @@ jobs:
           mkdir build
           cd build
           cmake -DLLAMA_SYCL=ON -DLLAMA_SYCL_F16=ON \
-          "-DCMAKE_C_COMPILER=icx -march=tigerlake -mno-avxvnni"" \
+          "-DCMAKE_C_COMPILER=icx -march=tigerlake -mno-avxvnni" \
           "-DCMAKE_CXX_COMPILER=icpx -march=tigerlake -mno-avxvnni" ..
           cmake --build . --config Release -j $(nproc)
           zip -r9XD /tmp/llama-latest-bin-ubuntu-sycl.zip *
