@@ -2861,7 +2861,7 @@ static int g_work_group_size = 0;
 
 //define for XMX in Intel GPU
 //TODO: currently, it's not used for XMX really.
-#define SYCL_USE_XMX
+//#define SYCL_USE_XMX
 
 // max batch size to use MMQ kernels when tensor cores are available
 #define XMX_MAX_BATCH_SIZE 32
@@ -11305,10 +11305,10 @@ void ggml_init_sycl() try {
         GGML_ASSERT(g_all_sycl_device_count <= GGML_SYCL_MAX_DEVICES);
         int64_t total_vram = 0;
 
-#if defined(GGML_SYCL_FP16)
-        fprintf(stderr, "%s: GGML_SYCL_FP16:   yes\n", __func__);
+#if defined(GGML_SYCL_F16)
+        fprintf(stderr, "%s: GGML_SYCL_F16:   yes\n", __func__);
 #else
-        fprintf(stderr, "%s: GGML_SYCL_FP16:   no\n", __func__);
+        fprintf(stderr, "%s: GGML_SYCL_F16:   no\n", __func__);
 #endif
 
 
