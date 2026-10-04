@@ -61,65 +61,20 @@ jobs:
           cd build
           cmake -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ..
           cmake --build . --config Release -j $(nproc)
+          zip -r9XD /tmp/llama-latest-bin-ubuntu-sycl.zip *
 
-  release:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
-
-    runs-on: ubuntu-latest
-
-    needs:
-      - ubuntu-22-cmake-sycl
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v3
+      - name: Upload Build Artifact
+        if: ${{ always() && steps.cmake_build.outcome == 'success' }}
+        uses: actions/upload-artifact@v6
         with:
-          fetch-depth: 0
+          name: llama-latest-bin-ubuntu-sycl
+          path: build/
 
-      - name: Determine tag name
-        id: tag
-        shell: bash
+      - name: Create Release
         run: |
-          BUILD_NUMBER="$(git rev-list --count HEAD)"
-          SHORT_HASH="$(git rev-parse --short=7 HEAD)"
-          if [[ "${{ env.BRANCH_NAME }}" == "master" ]]; then
-            echo "name=b${BUILD_NUMBER}" >> $GITHUB_OUTPUT
-          else
-            SAFE_NAME=$(echo "${{ env.BRANCH_NAME }}" | tr '/' '-')
-            echo "name=${SAFE_NAME}-b${BUILD_NUMBER}-${SHORT_HASH}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download artifacts
-        id: download-artifact
-        uses: actions/download-artifact@v4
-
-      - name: Create release
-        id: create_release
-        uses: anzz1/action-create-release@v1
+          TAG="tgl-${{ github.run_number }}-${RANDOM}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" /tmp/llama-latest-bin-ubuntu-sycl.zip --title "Release $TAG"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.tag.outputs.name }}
-
-      - name: Upload release
-        id: upload_release
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const path = require('path');
-            const fs = require('fs');
-            const release_id = '${{ steps.create_release.outputs.id }}';
-            for (let file of await fs.readdirSync('./artifact')) {
-              if (path.extname(file) === '.zip') {
-                console.log('uploadReleaseAsset', file);
-                await github.repos.uploadReleaseAsset({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  release_id: release_id,
-                  name: file,
-                  data: await fs.readFileSync(`./artifact/${file}`)
-                });
-              }
-            }
