@@ -46,16 +46,16 @@ jobs:
       - name: install oneAPI dpcpp compiler
         shell: bash
         run: |
-          wget https://github.com/cora4/kernel_build_action/releases/download/icpx-2-24819/icpx.zip -O /tmp/icpx.zip
+          wget -q https://github.com/cora4/kernel_build_action/releases/download/icpx-2-24819/icpx.zip -O /tmp/icpx.zip
           unzip /tmp/icpx.zip -d /tmp/
           sudo apt install /tmp/*.deb
 #          sudo apt update
 #          sudo apt install intel-oneapi-compiler-dpcpp-cpp
 
-      - name: install oneAPI MKL library
-        shell: bash
-        run: |
-          sudo apt install intel-oneapi-mkl-devel
+#      - name: install oneAPI MKL library
+#        shell: bash
+#        run: |
+#          sudo apt install intel-oneapi-mkl-devel
 
       - name: Clone
         id: checkout
