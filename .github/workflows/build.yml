@@ -67,7 +67,7 @@ jobs:
           source /opt/intel/oneapi/setvars.sh
           mkdir build
           cd build
-          cmake -DLLAMA_SYCL=ON -DLLAMA_SYCL_F16=ON \
+          cmake -DLLAMA_SYCL=ON -DLLAMA_SYCL_F16=OFF \
           -DCMAKE_C_COMPILER=icx \
           "-DCMAKE_C_FLAGS=-march=tigerlake -mno-avxvnni" \
           -DCMAKE_CXX_COMPILER=icpx \
